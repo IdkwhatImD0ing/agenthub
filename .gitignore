@@ -1,6 +1,9 @@
 # Binaries
 /agenthub-server
+/agenthub-server.exe
+/agenthub-server.exe~
 /ah
+/ah.exe
 
 # Data directory
 data/

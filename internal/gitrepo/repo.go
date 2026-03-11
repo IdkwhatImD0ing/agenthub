@@ -31,7 +31,11 @@ func Init(path string) (*Repo, error) {
 	if _, err := exec.LookPath("git"); err != nil {
 		return nil, fmt.Errorf("git binary not found on PATH: %w", err)
 	}
-	r := &Repo{Path: path}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve absolute path: %w", err)
+	}
+	r := &Repo{Path: absPath}
 	// Check if it already exists
 	if _, err := os.Stat(filepath.Join(path, "HEAD")); err == nil {
 		return r, nil
