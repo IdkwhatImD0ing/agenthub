@@ -1,0 +1,12 @@
+# Binaries
+/agenthub-server
+/ah
+
+# Data directory
+data/
+
+# Secrets
+.env
+
+# OS
+.DS_Store
