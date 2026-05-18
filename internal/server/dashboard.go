@@ -11,6 +11,7 @@ import (
 
 type dashboardData struct {
 	Stats    *db.Stats
+	Sessions []db.SessionStats
 	Agents   []db.Agent
 	Commits  []db.Commit
 	Channels []db.Channel
@@ -25,13 +26,15 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	stats, _ := s.db.GetStats()
+	sessions, _ := s.db.ListSessionStats()
 	agents, _ := s.db.ListAgents()
-	commits, _ := s.db.ListCommits("", 50, 0)
+	commits, _ := s.db.ListCommits("", "", 50, 0)
 	channels, _ := s.db.ListChannels()
 	posts, _ := s.db.RecentPosts(100)
 
 	data := dashboardData{
 		Stats:    stats,
+		Sessions: sessions,
 		Agents:   agents,
 		Commits:  commits,
 		Channels: channels,
@@ -117,6 +120,12 @@ var dashboardTmpl = template.Must(template.New("dashboard").Funcs(funcMap).Parse
   .reply-indicator { color: #555; font-size: 12px; }
   .empty { color: #444; font-style: italic; padding: 20px 0; }
   .parent-hash { color: #555; font-size: 12px; }
+  .session-tag { background: #1a2e1a; color: #7af7a2; padding: 2px 6px; border-radius: 3px; font-size: 12px; }
+  .status-open { color: #7af7a2; font-weight: bold; }
+  .status-done { color: #81a2be; font-weight: bold; }
+  .status-failed { color: #f07a7a; font-weight: bold; }
+  .task { color: #ccc; }
+  .result { color: #888; white-space: pre-wrap; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -125,19 +134,42 @@ var dashboardTmpl = template.Must(template.New("dashboard").Funcs(funcMap).Parse
   <div class="subtitle">auto-refreshes every 30s</div>
 
   <div class="stats">
+    <div class="stat"><div class="stat-value">{{.Stats.OpenSessions}}/{{.Stats.SessionCount}}</div><div class="stat-label">Sessions (open)</div></div>
     <div class="stat"><div class="stat-value">{{.Stats.AgentCount}}</div><div class="stat-label">Agents</div></div>
     <div class="stat"><div class="stat-value">{{.Stats.CommitCount}}</div><div class="stat-label">Commits</div></div>
     <div class="stat"><div class="stat-value">{{.Stats.PostCount}}</div><div class="stat-label">Posts</div></div>
   </div>
 
+  <h2>Sessions</h2>
+  {{if .Sessions}}
+  <table>
+    <tr><th>ID</th><th>Status</th><th>Task</th><th>Agents</th><th>Commits</th><th>Posts</th><th>Result</th><th>Started</th></tr>
+    {{range .Sessions}}
+    <tr>
+      <td><span class="session-tag">{{.ID}}</span></td>
+      <td class="status-{{.Status}}">{{.Status}}</td>
+      <td class="task">{{.Task}}</td>
+      <td>{{.AgentCount}}</td>
+      <td>{{.CommitCount}}</td>
+      <td>{{.PostCount}}</td>
+      <td class="result">{{if .Result}}{{.Result}}{{else}}&mdash;{{end}}</td>
+      <td class="time">{{timeago .CreatedAt}}</td>
+    </tr>
+    {{end}}
+  </table>
+  {{else}}
+  <div class="empty">no sessions yet — create one with: ah session create --task "…"</div>
+  {{end}}
+
   <h2>Commits</h2>
   {{if .Commits}}
   <table>
-    <tr><th>Hash</th><th>Parent</th><th>Agent</th><th>Message</th><th>When</th></tr>
+    <tr><th>Hash</th><th>Parent</th><th>Session</th><th>Agent</th><th>Message</th><th>When</th></tr>
     {{range .Commits}}
     <tr>
       <td class="hash">{{short .Hash}}</td>
       <td class="parent-hash">{{if .ParentHash}}{{short .ParentHash}}{{else}}&mdash;{{end}}</td>
+      <td>{{if .SessionID}}<span class="session-tag">{{.SessionID}}</span>{{else}}&mdash;{{end}}</td>
       <td class="agent">{{.AgentID}}</td>
       <td class="msg">{{.Message}}</td>
       <td class="time">{{timeago .CreatedAt}}</td>
@@ -154,6 +186,7 @@ var dashboardTmpl = template.Must(template.New("dashboard").Funcs(funcMap).Parse
   <div class="post">
     <div class="post-header">
       <span class="channel-tag">#{{.ChannelName}}</span>
+      {{if .SessionID}}<span class="session-tag">{{.SessionID}}</span>{{end}}
       <span class="agent">{{.AgentID}}</span>
       <span class="time">{{timeago .CreatedAt}}</span>
       {{if .ParentID}}<span class="reply-indicator">reply</span>{{end}}

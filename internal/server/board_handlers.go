@@ -61,6 +61,7 @@ func (s *Server) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListPosts(w http.ResponseWriter, r *http.Request) {
+	agent := auth.AgentFromContext(r.Context())
 	name := r.PathValue("name")
 	ch, err := s.db.GetChannelByName(name)
 	if err != nil {
@@ -75,7 +76,7 @@ func (s *Server) handleListPosts(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 
-	posts, err := s.db.ListPosts(ch.ID, limit, offset)
+	posts, err := s.db.ListPosts(ch.ID, agent.SessionID, limit, offset)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error")
 		return
@@ -89,6 +90,11 @@ func (s *Server) handleListPosts(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleCreatePost(w http.ResponseWriter, r *http.Request) {
 	agent := auth.AgentFromContext(r.Context())
 	name := r.PathValue("name")
+
+	sessionID, ok := s.requireOpenSession(w, agent)
+	if !ok {
+		return
+	}
 
 	ch, err := s.db.GetChannelByName(name)
 	if err != nil {
@@ -145,7 +151,7 @@ func (s *Server) handleCreatePost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	post, err := s.db.CreatePost(ch.ID, agent.ID, req.ParentID, req.Content)
+	post, err := s.db.CreatePost(ch.ID, agent.ID, sessionID, req.ParentID, req.Content)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create post")
 		return

@@ -10,7 +10,8 @@ import (
 
 func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ID string `json:"id"`
+		ID        string `json:"id"`
+		SessionID string `json:"session_id"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
@@ -18,6 +19,23 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.ID == "" {
 		writeError(w, http.StatusBadRequest, "id is required")
+		return
+	}
+	if req.SessionID == "" {
+		writeError(w, http.StatusBadRequest, "session_id is required")
+		return
+	}
+	sess, err := s.db.GetSession(req.SessionID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	if sess == nil {
+		writeError(w, http.StatusBadRequest, "session not found")
+		return
+	}
+	if sess.Status != "open" {
+		writeError(w, http.StatusConflict, "session is closed; cannot add agents")
 		return
 	}
 
@@ -40,14 +58,15 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	apiKey := hex.EncodeToString(keyBytes)
 
-	if err := s.db.CreateAgent(req.ID, apiKey); err != nil {
+	if err := s.db.CreateAgent(req.ID, apiKey, req.SessionID); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create agent")
 		return
 	}
 
 	writeJSON(w, http.StatusCreated, map[string]string{
-		"id":      req.ID,
-		"api_key": apiKey,
+		"id":         req.ID,
+		"api_key":    apiKey,
+		"session_id": req.SessionID,
 	})
 }
 
@@ -68,7 +87,8 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		ID string `json:"id"`
+		ID        string `json:"id"`
+		SessionID string `json:"session_id"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
@@ -76,6 +96,23 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	if !agentIDRe.MatchString(req.ID) {
 		writeError(w, http.StatusBadRequest, "id must be 1-63 chars, alphanumeric/dash/dot/underscore, start with alphanumeric")
+		return
+	}
+	if req.SessionID == "" {
+		writeError(w, http.StatusBadRequest, "session_id is required")
+		return
+	}
+	sess, err := s.db.GetSession(req.SessionID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "database error")
+		return
+	}
+	if sess == nil {
+		writeError(w, http.StatusBadRequest, "session not found")
+		return
+	}
+	if sess.Status != "open" {
+		writeError(w, http.StatusConflict, "session is closed; cannot add agents")
 		return
 	}
 
@@ -96,7 +133,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	apiKey := hex.EncodeToString(keyBytes)
 
-	if err := s.db.CreateAgent(req.ID, apiKey); err != nil {
+	if err := s.db.CreateAgent(req.ID, apiKey, req.SessionID); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create agent")
 		return
 	}
@@ -104,7 +141,8 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	s.db.IncrementRateLimit("ip:"+ip, "register")
 
 	writeJSON(w, http.StatusCreated, map[string]string{
-		"id":      req.ID,
-		"api_key": apiKey,
+		"id":         req.ID,
+		"api_key":    apiKey,
+		"session_id": req.SessionID,
 	})
 }

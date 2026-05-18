@@ -20,6 +20,7 @@ type CLIConfig struct {
 	ServerURL string `json:"server_url"`
 	APIKey    string `json:"api_key"`
 	AgentID   string `json:"agent_id"`
+	SessionID string `json:"session_id"`
 }
 
 func configDir() string {
@@ -131,6 +132,7 @@ func cmdJoin(args []string) {
 	serverFlag := fs.String("server", "", "server URL")
 	agentID := fs.String("name", "", "agent name/id")
 	adminKey := fs.String("admin-key", "", "admin key to register agent")
+	sessionID := fs.String("session", "", "session id to bind this agent to")
 	fs.Parse(args)
 
 	// Accept server URL as flag or positional arg
@@ -140,8 +142,8 @@ func cmdJoin(args []string) {
 	}
 	serverURL = strings.TrimRight(serverURL, "/")
 
-	if serverURL == "" || *agentID == "" || *adminKey == "" {
-		fmt.Fprintln(os.Stderr, "usage: ah join --server <url> --name <id> --admin-key <key>")
+	if serverURL == "" || *agentID == "" || *adminKey == "" || *sessionID == "" {
+		fmt.Fprintln(os.Stderr, "usage: ah join --server <url> --name <id> --admin-key <key> --session <session-id>")
 		os.Exit(1)
 	}
 
@@ -151,7 +153,10 @@ func cmdJoin(args []string) {
 		APIKey:  *adminKey,
 		HTTP:    &http.Client{Timeout: 30 * time.Second},
 	}
-	resp, err := client.postJSON("/api/admin/agents", map[string]string{"id": *agentID})
+	resp, err := client.postJSON("/api/admin/agents", map[string]string{
+		"id":         *agentID,
+		"session_id": *sessionID,
+	})
 	if err != nil {
 		fatal("failed to register: %v", err)
 	}
@@ -165,12 +170,13 @@ func cmdJoin(args []string) {
 		ServerURL: serverURL,
 		APIKey:    apiKey,
 		AgentID:   *agentID,
+		SessionID: *sessionID,
 	}
 	if err := saveConfig(cfg); err != nil {
 		fatal("failed to save config: %v", err)
 	}
 
-	fmt.Printf("joined %s as %q\n", serverURL, *agentID)
+	fmt.Printf("joined %s as %q (session %s)\n", serverURL, *agentID, *sessionID)
 	fmt.Printf("api key: %s\n", apiKey)
 	fmt.Printf("config saved to %s\n", configPath())
 }
@@ -515,6 +521,138 @@ func cmdReply(args []string) {
 	fmt.Printf("replied #%v to #%d in #%s\n", result["id"], postID, channelName)
 }
 
+// Session commands (operator-owned lifecycle)
+
+func cmdSession(args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: ah session <create|list|close|show> ...")
+		os.Exit(1)
+	}
+	switch args[0] {
+	case "create":
+		cmdSessionCreate(args[1:])
+	case "list":
+		cmdSessionList(args[1:])
+	case "close":
+		cmdSessionClose(args[1:])
+	case "show":
+		cmdSessionShow(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "unknown session subcommand: %s\n", args[0])
+		os.Exit(1)
+	}
+}
+
+func adminClient(server, adminKey string) *Client {
+	if server == "" || adminKey == "" {
+		fmt.Fprintln(os.Stderr, "--server and --admin-key are required")
+		os.Exit(1)
+	}
+	return &Client{
+		BaseURL: strings.TrimRight(server, "/"),
+		APIKey:  adminKey,
+		HTTP:    &http.Client{Timeout: 30 * time.Second},
+	}
+}
+
+func cmdSessionCreate(args []string) {
+	fs := flag.NewFlagSet("session create", flag.ExitOnError)
+	server := fs.String("server", "", "server URL")
+	adminKey := fs.String("admin-key", "", "admin key")
+	task := fs.String("task", "", "task description for the swarm")
+	id := fs.String("id", "", "optional explicit session id")
+	fs.Parse(args)
+
+	if *task == "" {
+		fatal("--task is required")
+	}
+	client := adminClient(*server, *adminKey)
+	resp, err := client.postJSON("/api/admin/sessions", map[string]string{"id": *id, "task": *task})
+	if err != nil {
+		fatal("create failed: %v", err)
+	}
+	var sess map[string]any
+	if err := readJSON(resp, &sess); err != nil {
+		fatal("create failed: %v", err)
+	}
+	fmt.Printf("session %v created (status=%v)\n", sess["id"], sess["status"])
+	fmt.Printf("task: %v\n", sess["task"])
+	fmt.Printf("\nprovision agents with:\n  ah join --server %s --name <id> --admin-key <key> --session %v\n",
+		strings.TrimRight(*server, "/"), sess["id"])
+}
+
+func cmdSessionList(args []string) {
+	fs := flag.NewFlagSet("session list", flag.ExitOnError)
+	server := fs.String("server", "", "server URL")
+	adminKey := fs.String("admin-key", "", "admin key")
+	fs.Parse(args)
+
+	client := adminClient(*server, *adminKey)
+	resp, err := client.get("/api/admin/sessions")
+	if err != nil {
+		fatal("request failed: %v", err)
+	}
+	var sessions []map[string]any
+	if err := readJSON(resp, &sessions); err != nil {
+		fatal("failed: %v", err)
+	}
+	if len(sessions) == 0 {
+		fmt.Println("no sessions")
+		return
+	}
+	for _, s := range sessions {
+		fmt.Printf("%-16v %-7v agents=%v commits=%v posts=%v  %s\n",
+			s["id"], s["status"], s["AgentCount"], s["CommitCount"], s["PostCount"], str(s["task"]))
+	}
+}
+
+func cmdSessionClose(args []string) {
+	fs := flag.NewFlagSet("session close", flag.ExitOnError)
+	server := fs.String("server", "", "server URL")
+	adminKey := fs.String("admin-key", "", "admin key")
+	status := fs.String("status", "done", "done | failed")
+	commit := fs.String("result", "", "final result commit hash")
+	summary := fs.String("summary", "", "result summary")
+	fs.Parse(args)
+
+	if fs.NArg() < 1 {
+		fatal("usage: ah session close <session-id> [--status done|failed] [--result <hash>] [--summary ...]")
+	}
+	client := adminClient(*server, *adminKey)
+	resp, err := client.postJSON("/api/admin/sessions/"+fs.Arg(0)+"/close", map[string]string{
+		"status":  *status,
+		"commit":  *commit,
+		"summary": *summary,
+	})
+	if err != nil {
+		fatal("close failed: %v", err)
+	}
+	var sess map[string]any
+	if err := readJSON(resp, &sess); err != nil {
+		fatal("close failed: %v", err)
+	}
+	fmt.Printf("session %v closed (status=%v)\n", sess["id"], sess["status"])
+}
+
+func cmdSessionShow(args []string) {
+	cfg := mustLoadConfig()
+	client := newClient(cfg)
+	resp, err := client.get("/api/session")
+	if err != nil {
+		fatal("request failed: %v", err)
+	}
+	var sess map[string]any
+	if err := readJSON(resp, &sess); err != nil {
+		fatal("failed: %v", err)
+	}
+	fmt.Printf("session: %v\n", sess["id"])
+	fmt.Printf("status:  %v\n", sess["status"])
+	fmt.Printf("task:    %v\n", sess["task"])
+	if r := str(sess["result"]); r != "" {
+		fmt.Printf("result:  %s\n", r)
+	}
+}
+
 // Helpers
 
 func mustLoadConfig() *CLIConfig {
@@ -586,6 +724,8 @@ func main() {
 	switch cmd {
 	case "join":
 		cmdJoin(args)
+	case "session":
+		cmdSession(args)
 	case "push":
 		cmdPush(args)
 	case "fetch":
@@ -618,8 +758,14 @@ func main() {
 func printUsage() {
 	fmt.Println(`ah — CLI for Agent Hub
 
+Session commands (operator):
+  session create --task "..." --server <url> --admin-key <key>
+  session list --server <url> --admin-key <key>
+  session close <id> [--status done|failed] [--result <hash>] [--summary ...]
+  session show                                show this agent's session
+
 Git commands:
-  join <url> --name <id> --admin-key <key>   register as agent
+  join <url> --name <id> --admin-key <key> --session <id>   register as agent
   push                                        push HEAD commit to hub
   fetch <hash>                                fetch a commit from hub
   log [--agent X] [--limit N]                 list recent commits

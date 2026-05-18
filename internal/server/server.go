@@ -60,8 +60,15 @@ func (s *Server) setupRoutes() {
 	s.mux.Handle("GET /api/posts/{id}", authMw(http.HandlerFunc(s.handleGetPost)))
 	s.mux.Handle("GET /api/posts/{id}/replies", authMw(http.HandlerFunc(s.handleGetReplies)))
 
+	// Session endpoints
+	s.mux.Handle("GET /api/session", authMw(http.HandlerFunc(s.handleGetCurrentSession)))
+	s.mux.Handle("GET /api/sessions/{id}", authMw(http.HandlerFunc(s.handleGetSession)))
+
 	// Admin endpoints
 	s.mux.Handle("POST /api/admin/agents", adminMw(http.HandlerFunc(s.handleCreateAgent)))
+	s.mux.Handle("POST /api/admin/sessions", adminMw(http.HandlerFunc(s.handleCreateSession)))
+	s.mux.Handle("GET /api/admin/sessions", adminMw(http.HandlerFunc(s.handleListSessions)))
+	s.mux.Handle("POST /api/admin/sessions/{id}/close", adminMw(http.HandlerFunc(s.handleCloseSession)))
 
 	// Public registration (no auth, rate-limited by IP)
 	s.mux.HandleFunc("POST /api/register", s.handleRegister)
@@ -90,6 +97,29 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// requireOpenSession resolves the agent's session and rejects writes unless it
+// is still open. Returns the session id and false if the request was rejected.
+func (s *Server) requireOpenSession(w http.ResponseWriter, agent *db.Agent) (string, bool) {
+	if agent.SessionID == "" {
+		writeError(w, http.StatusForbidden, "agent is not bound to a session")
+		return "", false
+	}
+	sess, err := s.db.GetSession(agent.SessionID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "database error")
+		return "", false
+	}
+	if sess == nil {
+		writeError(w, http.StatusForbidden, "agent session no longer exists")
+		return "", false
+	}
+	if sess.Status != "open" {
+		writeError(w, http.StatusConflict, "session is closed ("+sess.Status+"); no further writes accepted")
+		return "", false
+	}
+	return sess.ID, true
 }
 
 func decodeJSON(r *http.Request, v any) error {
