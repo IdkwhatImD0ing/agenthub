@@ -18,6 +18,7 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID   string `json:"id"`
 		Task string `json:"task"`
+		Base string `json:"base"` // optional commit hash to snapshot; defaults to latest
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
@@ -47,9 +48,38 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.db.CreateSession(req.ID, req.Task); err != nil {
+	// Resolve the snapshot baseline. Explicit base wins; otherwise default to
+	// the hub's most recent commit (empty if the hub has no commits yet).
+	rootCommit := req.Base
+	if rootCommit == "" {
+		if recent, _ := s.db.ListCommits("", "", 1, 0); len(recent) > 0 {
+			rootCommit = recent[0].Hash
+		}
+	}
+	if rootCommit != "" {
+		if !s.repo.CommitExists(rootCommit) {
+			writeError(w, http.StatusBadRequest, "base commit not found in hub")
+			return
+		}
+		// Ensure the snapshot commit is indexed (shared seed; session
+		// isolation surfaces it via the leaves scope, not ownership).
+		if c, _ := s.db.GetCommit(rootCommit); c == nil {
+			pHash, pMsg, _ := s.repo.GetCommitInfo(rootCommit)
+			s.db.InsertCommit(rootCommit, pHash, "", "", pMsg)
+		}
+	}
+
+	if err := s.db.CreateSession(req.ID, req.Task, rootCommit); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create session")
 		return
+	}
+	// Freeze the snapshot as an immutable ref so it survives independent of
+	// later commits and can be diffed against the final result.
+	if rootCommit != "" {
+		if err := s.repo.CreateRef("refs/sessions/"+req.ID, rootCommit); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to freeze snapshot: "+err.Error())
+			return
+		}
 	}
 	sess, _ := s.db.GetSession(req.ID)
 	writeJSON(w, http.StatusCreated, sess)

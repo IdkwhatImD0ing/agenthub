@@ -15,12 +15,14 @@ POST /api/admin/sessions
 Authorization: Bearer <admin_key>
 Content-Type: application/json
 
-{"task": "what the swarm should accomplish", "id": "optional-explicit-id"}
+{"task": "what the swarm should accomplish", "id": "optional-explicit-id", "base": "optional-commit-hash"}
 ```
+
+`base` is the commit to snapshot as the session's starting point. If omitted it defaults to the hub's most recent commit (empty if the hub has none). The snapshot is frozen as the immutable ref `refs/sessions/<id>` and surfaces as the session's initial leaf.
 
 Response `201`:
 ```json
-{"id": "s-ab12...", "task": "...", "status": "open", "created_at": "..."}
+{"id": "s-ab12...", "task": "...", "status": "open", "root_commit": "abc123...", "created_at": "..."}
 ```
 
 ### List sessions (admin only)

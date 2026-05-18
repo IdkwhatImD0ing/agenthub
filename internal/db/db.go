@@ -12,12 +12,13 @@ import (
 // Model structs
 
 type Session struct {
-	ID        string     `json:"id"`
-	Task      string     `json:"task"`
-	Status    string     `json:"status"` // open | done | failed
-	Result    string     `json:"result,omitempty"`
-	CreatedAt time.Time  `json:"created_at"`
-	ClosedAt  *time.Time `json:"closed_at,omitempty"`
+	ID         string     `json:"id"`
+	Task       string     `json:"task"`
+	Status     string     `json:"status"` // open | done | failed
+	RootCommit string     `json:"root_commit,omitempty"`
+	Result     string     `json:"result,omitempty"`
+	CreatedAt  time.Time  `json:"created_at"`
+	ClosedAt   *time.Time `json:"closed_at,omitempty"`
 }
 
 type Agent struct {
@@ -88,6 +89,7 @@ func (d *DB) Migrate() error {
 			id TEXT PRIMARY KEY,
 			task TEXT NOT NULL DEFAULT '',
 			status TEXT NOT NULL DEFAULT 'open',
+			root_commit TEXT NOT NULL DEFAULT '',
 			result TEXT NOT NULL DEFAULT '',
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			closed_at TIMESTAMP
@@ -150,6 +152,7 @@ func (d *DB) Migrate() error {
 		"ALTER TABLE agents ADD COLUMN session_id TEXT REFERENCES sessions(id)",
 		"ALTER TABLE commits ADD COLUMN session_id TEXT",
 		"ALTER TABLE posts ADD COLUMN session_id TEXT",
+		"ALTER TABLE sessions ADD COLUMN root_commit TEXT NOT NULL DEFAULT ''",
 	} {
 		if _, aerr := d.db.Exec(stmt); aerr != nil && !strings.Contains(aerr.Error(), "duplicate column name") {
 			return aerr
@@ -160,8 +163,8 @@ func (d *DB) Migrate() error {
 
 // --- Sessions ---
 
-func (d *DB) CreateSession(id, task string) error {
-	_, err := d.db.Exec("INSERT INTO sessions (id, task) VALUES (?, ?)", id, task)
+func (d *DB) CreateSession(id, task, rootCommit string) error {
+	_, err := d.db.Exec("INSERT INTO sessions (id, task, root_commit) VALUES (?, ?, ?)", id, task, rootCommit)
 	return err
 }
 
@@ -169,8 +172,8 @@ func (d *DB) GetSession(id string) (*Session, error) {
 	var s Session
 	var closedAt sql.NullTime
 	err := d.db.QueryRow(
-		"SELECT id, task, status, result, created_at, closed_at FROM sessions WHERE id = ?", id,
-	).Scan(&s.ID, &s.Task, &s.Status, &s.Result, &s.CreatedAt, &closedAt)
+		"SELECT id, task, status, root_commit, result, created_at, closed_at FROM sessions WHERE id = ?", id,
+	).Scan(&s.ID, &s.Task, &s.Status, &s.RootCommit, &s.Result, &s.CreatedAt, &closedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -181,7 +184,7 @@ func (d *DB) GetSession(id string) (*Session, error) {
 }
 
 func (d *DB) ListSessions() ([]Session, error) {
-	rows, err := d.db.Query("SELECT id, task, status, result, created_at, closed_at FROM sessions ORDER BY created_at DESC")
+	rows, err := d.db.Query("SELECT id, task, status, root_commit, result, created_at, closed_at FROM sessions ORDER BY created_at DESC")
 	if err != nil {
 		return nil, err
 	}
@@ -190,7 +193,7 @@ func (d *DB) ListSessions() ([]Session, error) {
 	for rows.Next() {
 		var s Session
 		var closedAt sql.NullTime
-		if err := rows.Scan(&s.ID, &s.Task, &s.Status, &s.Result, &s.CreatedAt, &closedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.Task, &s.Status, &s.RootCommit, &s.Result, &s.CreatedAt, &closedAt); err != nil {
 			return nil, err
 		}
 		if closedAt.Valid {
@@ -199,6 +202,12 @@ func (d *DB) ListSessions() ([]Session, error) {
 		sessions = append(sessions, s)
 	}
 	return sessions, rows.Err()
+}
+
+func (d *DB) CountAgentsInSession(sessionID string) (int, error) {
+	var n int
+	err := d.db.QueryRow("SELECT COUNT(*) FROM agents WHERE session_id = ?", sessionID).Scan(&n)
+	return n, err
 }
 
 // CloseSession sets a terminal status and result. status must be done or failed.
@@ -334,20 +343,36 @@ func (d *DB) GetLineage(hash string) ([]Commit, error) {
 }
 
 // GetLeaves returns frontier commits for a session (tips with no children).
+// The scope is the session's own commits plus its frozen root snapshot, so a
+// brand-new session's frontier is the snapshot until the swarm builds on it.
 // sessionID "" returns leaves across all sessions (operator/dashboard view).
-func (d *DB) GetLeaves(sessionID string) ([]Commit, error) {
-	q := `
-		SELECT c.hash, c.parent_hash, c.agent_id, c.session_id, c.message, c.created_at
-		FROM commits c
-		LEFT JOIN commits child ON child.parent_hash = c.hash
-		WHERE child.hash IS NULL`
-	var args []any
-	if sessionID != "" {
-		q += " AND c.session_id = ?"
-		args = append(args, sessionID)
+func (d *DB) GetLeaves(sessionID, rootCommit string) ([]Commit, error) {
+	if sessionID == "" {
+		rows, err := d.db.Query(`
+			SELECT c.hash, c.parent_hash, c.agent_id, c.session_id, c.message, c.created_at
+			FROM commits c
+			LEFT JOIN commits child ON child.parent_hash = c.hash
+			WHERE child.hash IS NULL
+			ORDER BY c.created_at DESC`)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		return scanCommits(rows)
 	}
-	q += " ORDER BY c.created_at DESC"
-	rows, err := d.db.Query(q, args...)
+	rows, err := d.db.Query(`
+		WITH scope AS (
+			SELECT hash, parent_hash, agent_id, session_id, message, created_at
+			FROM commits WHERE session_id = ?
+			UNION
+			SELECT hash, parent_hash, agent_id, session_id, message, created_at
+			FROM commits WHERE hash = ?
+		)
+		SELECT s.hash, s.parent_hash, s.agent_id, s.session_id, s.message, s.created_at
+		FROM scope s
+		LEFT JOIN scope child ON child.parent_hash = s.hash
+		WHERE child.hash IS NULL
+		ORDER BY s.created_at DESC`, sessionID, rootCommit)
 	if err != nil {
 		return nil, err
 	}

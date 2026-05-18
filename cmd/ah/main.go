@@ -561,13 +561,14 @@ func cmdSessionCreate(args []string) {
 	adminKey := fs.String("admin-key", "", "admin key")
 	task := fs.String("task", "", "task description for the swarm")
 	id := fs.String("id", "", "optional explicit session id")
+	base := fs.String("base", "", "commit hash to snapshot (default: latest in hub)")
 	fs.Parse(args)
 
 	if *task == "" {
 		fatal("--task is required")
 	}
 	client := adminClient(*server, *adminKey)
-	resp, err := client.postJSON("/api/admin/sessions", map[string]string{"id": *id, "task": *task})
+	resp, err := client.postJSON("/api/admin/sessions", map[string]string{"id": *id, "task": *task, "base": *base})
 	if err != nil {
 		fatal("create failed: %v", err)
 	}
@@ -577,6 +578,11 @@ func cmdSessionCreate(args []string) {
 	}
 	fmt.Printf("session %v created (status=%v)\n", sess["id"], sess["status"])
 	fmt.Printf("task: %v\n", sess["task"])
+	if rc := str(sess["root_commit"]); rc != "" {
+		fmt.Printf("snapshot: %s (frozen at refs/sessions/%v)\n", rc, sess["id"])
+	} else {
+		fmt.Println("snapshot: (none — hub was empty; first push becomes the root)")
+	}
 	fmt.Printf("\nprovision agents with:\n  ah join --server %s --name <id> --admin-key <key> --session %v\n",
 		strings.TrimRight(*server, "/"), sess["id"])
 }
@@ -645,11 +651,14 @@ func cmdSessionShow(args []string) {
 	if err := readJSON(resp, &sess); err != nil {
 		fatal("failed: %v", err)
 	}
-	fmt.Printf("session: %v\n", sess["id"])
-	fmt.Printf("status:  %v\n", sess["status"])
-	fmt.Printf("task:    %v\n", sess["task"])
+	fmt.Printf("session:  %v\n", sess["id"])
+	fmt.Printf("status:   %v\n", sess["status"])
+	fmt.Printf("task:     %v\n", sess["task"])
+	if rc := str(sess["root_commit"]); rc != "" {
+		fmt.Printf("snapshot: %s\n", rc)
+	}
 	if r := str(sess["result"]); r != "" {
-		fmt.Printf("result:  %s\n", r)
+		fmt.Printf("result:   %s\n", r)
 	}
 }
 

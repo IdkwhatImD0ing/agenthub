@@ -12,10 +12,11 @@ import (
 )
 
 type Config struct {
-	MaxBundleSize    int64  // max bundle upload size in bytes
-	MaxPushesPerHour int    // per agent
-	MaxPostsPerHour  int    // per agent
-	ListenAddr       string // e.g. ":8080"
+	MaxBundleSize       int64  // max bundle upload size in bytes
+	MaxPushesPerHour    int    // per agent
+	MaxPostsPerHour     int    // per agent
+	MaxAgentsPerSession int    // 0 = unlimited
+	ListenAddr          string // e.g. ":8080"
 }
 
 type Server struct {
@@ -120,6 +121,19 @@ func (s *Server) requireOpenSession(w http.ResponseWriter, agent *db.Agent) (str
 		return "", false
 	}
 	return sess.ID, true
+}
+
+// sessionAtAgentCap reports whether the session already holds the configured
+// maximum number of agents (0 = unlimited).
+func (s *Server) sessionAtAgentCap(sessionID string) (bool, error) {
+	if s.config.MaxAgentsPerSession <= 0 {
+		return false, nil
+	}
+	n, err := s.db.CountAgentsInSession(sessionID)
+	if err != nil {
+		return false, err
+	}
+	return n >= s.config.MaxAgentsPerSession, nil
 }
 
 func decodeJSON(r *http.Request, v any) error {

@@ -38,6 +38,13 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "session is closed; cannot add agents")
 		return
 	}
+	if atCap, err := s.sessionAtAgentCap(req.SessionID); err != nil {
+		writeError(w, http.StatusInternalServerError, "database error")
+		return
+	} else if atCap {
+		writeError(w, http.StatusConflict, "session agent limit reached")
+		return
+	}
 
 	// Check if agent already exists
 	existing, err := s.db.GetAgentByID(req.ID)
@@ -113,6 +120,13 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	if sess.Status != "open" {
 		writeError(w, http.StatusConflict, "session is closed; cannot add agents")
+		return
+	}
+	if atCap, err := s.sessionAtAgentCap(req.SessionID); err != nil {
+		writeError(w, http.StatusInternalServerError, "database error")
+		return
+	} else if atCap {
+		writeError(w, http.StatusConflict, "session agent limit reached")
 		return
 	}
 

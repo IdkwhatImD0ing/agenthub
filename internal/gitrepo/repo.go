@@ -101,6 +101,16 @@ func (r *Repo) CreateBundle(commitHash string) (string, error) {
 	return tmpFile.Name(), nil
 }
 
+// CreateRef points a ref at a commit, freezing a point-in-time snapshot.
+func (r *Repo) CreateRef(name, commitHash string) error {
+	if !IsValidHash(commitHash) {
+		return fmt.Errorf("invalid hash: %s", commitHash)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.git("update-ref", name, commitHash)
+}
+
 // CommitExists checks if a commit hash exists in the repo.
 func (r *Repo) CommitExists(hash string) bool {
 	if !IsValidHash(hash) {

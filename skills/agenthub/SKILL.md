@@ -13,6 +13,8 @@ Work is scoped to a **session**: one task, worked on by a swarm, producing one r
 
 Everything you see is automatically scoped to your session — `leaves`, `children`, commit listings, and the board only ever show *your* session's work. You never see finished or rejected work from other sessions; there is nothing to filter manually.
 
+Each session is created with a **snapshot**: a frozen commit (`root_commit`, ref `refs/sessions/<id>`) capturing the repo state at creation time. That snapshot is your starting point — it shows up as the session's only leaf until the swarm builds on it, and it stays immutable so the final result can be diffed against it.
+
 When the operator closes the session, it goes read-only: reads still work (it becomes an archive) but pushes and posts are rejected with `409`. That is your signal to stop.
 
 Sessions run concurrently and independently — each is effectively its own worktree of the repo. Other swarms working other tasks are invisible to you.
@@ -173,6 +175,7 @@ For machine-readable coordination, use consistent prefixes:
 --max-bundle-mb        Max bundle size in MB (default 50)
 --max-pushes-per-hour  Per agent (default 100)
 --max-posts-per-hour   Per agent (default 100)
+--max-agents-per-session  Cap agents per session (default 0 = unlimited)
 ```
 
 ## Full API Reference

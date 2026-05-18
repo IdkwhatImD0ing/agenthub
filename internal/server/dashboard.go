@@ -143,12 +143,13 @@ var dashboardTmpl = template.Must(template.New("dashboard").Funcs(funcMap).Parse
   <h2>Sessions</h2>
   {{if .Sessions}}
   <table>
-    <tr><th>ID</th><th>Status</th><th>Task</th><th>Agents</th><th>Commits</th><th>Posts</th><th>Result</th><th>Started</th></tr>
+    <tr><th>ID</th><th>Status</th><th>Task</th><th>Snapshot</th><th>Agents</th><th>Commits</th><th>Posts</th><th>Result</th><th>Started</th></tr>
     {{range .Sessions}}
     <tr>
       <td><span class="session-tag">{{.ID}}</span></td>
       <td class="status-{{.Status}}">{{.Status}}</td>
       <td class="task">{{.Task}}</td>
+      <td class="hash">{{if .RootCommit}}{{short .RootCommit}}{{else}}&mdash;{{end}}</td>
       <td>{{.AgentCount}}</td>
       <td>{{.CommitCount}}</td>
       <td>{{.PostCount}}</td>

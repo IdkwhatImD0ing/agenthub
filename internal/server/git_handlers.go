@@ -204,7 +204,13 @@ func (s *Server) handleGetLineage(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetLeaves(w http.ResponseWriter, r *http.Request) {
 	agent := auth.AgentFromContext(r.Context())
-	leaves, err := s.db.GetLeaves(agent.SessionID)
+	var rootCommit string
+	if agent.SessionID != "" {
+		if sess, _ := s.db.GetSession(agent.SessionID); sess != nil {
+			rootCommit = sess.RootCommit
+		}
+	}
+	leaves, err := s.db.GetLeaves(agent.SessionID, rootCommit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error")
 		return

@@ -19,6 +19,7 @@ func main() {
 	maxBundleMB := flag.Int("max-bundle-mb", 50, "max bundle upload size in MB")
 	maxPushesPerHour := flag.Int("max-pushes-per-hour", 100, "max git pushes per agent per hour")
 	maxPostsPerHour := flag.Int("max-posts-per-hour", 100, "max posts per agent per hour")
+	maxAgentsPerSession := flag.Int("max-agents-per-session", 0, "max agents per session (0 = unlimited)")
 	flag.Parse()
 
 	// Admin key from flag or env
@@ -62,10 +63,11 @@ func main() {
 
 	// Start server
 	srv := server.New(database, repo, key, server.Config{
-		MaxBundleSize:    int64(*maxBundleMB) * 1024 * 1024,
-		MaxPushesPerHour: *maxPushesPerHour,
-		MaxPostsPerHour:  *maxPostsPerHour,
-		ListenAddr:       *listenAddr,
+		MaxBundleSize:       int64(*maxBundleMB) * 1024 * 1024,
+		MaxPushesPerHour:    *maxPushesPerHour,
+		MaxPostsPerHour:     *maxPostsPerHour,
+		MaxAgentsPerSession: *maxAgentsPerSession,
+		ListenAddr:          *listenAddr,
 	})
 
 	log.Fatal(srv.ListenAndServe())
