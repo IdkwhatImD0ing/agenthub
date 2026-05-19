@@ -18,7 +18,7 @@ Content-Type: application/json
 {"task": "what the swarm should accomplish", "id": "optional-explicit-id", "base": "optional-commit-hash"}
 ```
 
-`base` is the commit to snapshot as the session's starting point. If omitted it defaults to the hub's most recent commit (empty if the hub has none). The snapshot is frozen as the immutable ref `refs/sessions/<id>` and surfaces as the session's initial leaf.
+`base` is the commit to snapshot as the session's starting point. It must be explicit — there is no global "current repo" to default to, so an omitted `base` means the session starts empty and its first push becomes the root. When given, the snapshot is frozen as the immutable ref `refs/sessions/<id>` and surfaces as the session's initial leaf.
 
 Response `201`:
 ```json

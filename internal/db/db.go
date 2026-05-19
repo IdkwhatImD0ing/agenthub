@@ -238,6 +238,66 @@ func (d *DB) CreateAgent(id, apiKey, sessionID string) error {
 	return err
 }
 
+// CreateAgentCapped atomically creates an agent only if the session is below
+// maxAgents (<=0 means unlimited). Returns false if the cap was reached.
+func (d *DB) CreateAgentCapped(id, apiKey, sessionID string, maxAgents int) (bool, error) {
+	if maxAgents <= 0 {
+		return true, d.CreateAgent(id, apiKey, sessionID)
+	}
+	res, err := d.db.Exec(`
+		INSERT INTO agents (id, api_key, session_id)
+		SELECT ?, ?, ?
+		WHERE (SELECT COUNT(*) FROM agents WHERE session_id = ?) < ?`,
+		id, apiKey, sessionID, sessionID, maxAgents,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, _ := res.RowsAffected()
+	return n > 0, nil
+}
+
+// CommitVisibleInSession reports whether a commit hash is reachable from a
+// session: either it was made in that session, or it is the session's frozen
+// snapshot root (whose row may belong to another session).
+func (d *DB) CommitVisibleInSession(hash, sessionID, rootCommit string) (bool, error) {
+	var one int
+	err := d.db.QueryRow(
+		"SELECT 1 FROM commits WHERE hash = ? AND (session_id = ? OR hash = ?)",
+		hash, sessionID, rootCommit,
+	).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// GetLineageScoped walks ancestry but stays within the session: it stops once
+// it reaches the snapshot root (inclusive) or leaves the session's scope, so
+// pre-snapshot history of other sessions is never exposed.
+func (d *DB) GetLineageScoped(hash, sessionID, rootCommit string) ([]Commit, error) {
+	var lineage []Commit
+	current := hash
+	for current != "" {
+		c, err := d.GetCommit(current)
+		if err != nil {
+			return lineage, err
+		}
+		if c == nil {
+			break
+		}
+		if c.SessionID != sessionID && c.Hash != rootCommit {
+			break
+		}
+		lineage = append(lineage, *c)
+		if c.Hash == rootCommit {
+			break
+		}
+		current = c.ParentHash
+	}
+	return lineage, nil
+}
+
 func (d *DB) GetAgentByAPIKey(apiKey string) (*Agent, error) {
 	var a Agent
 	var sessionID sql.NullString
@@ -557,19 +617,31 @@ type SessionStats struct {
 }
 
 func (d *DB) ListSessionStats() ([]SessionStats, error) {
-	sessions, err := d.ListSessions()
+	rows, err := d.db.Query(`
+		SELECT s.id, s.task, s.status, s.root_commit, s.result, s.created_at, s.closed_at,
+			(SELECT COUNT(*) FROM agents  a WHERE a.session_id = s.id),
+			(SELECT COUNT(*) FROM commits c WHERE c.session_id = s.id),
+			(SELECT COUNT(*) FROM posts   p WHERE p.session_id = s.id)
+		FROM sessions s
+		ORDER BY s.created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 	var out []SessionStats
-	for _, s := range sessions {
-		ss := SessionStats{Session: s}
-		d.db.QueryRow("SELECT COUNT(*) FROM agents WHERE session_id = ?", s.ID).Scan(&ss.AgentCount)
-		d.db.QueryRow("SELECT COUNT(*) FROM commits WHERE session_id = ?", s.ID).Scan(&ss.CommitCount)
-		d.db.QueryRow("SELECT COUNT(*) FROM posts WHERE session_id = ?", s.ID).Scan(&ss.PostCount)
+	for rows.Next() {
+		var ss SessionStats
+		var closedAt sql.NullTime
+		if err := rows.Scan(&ss.ID, &ss.Task, &ss.Status, &ss.RootCommit, &ss.Result,
+			&ss.CreatedAt, &closedAt, &ss.AgentCount, &ss.CommitCount, &ss.PostCount); err != nil {
+			return nil, err
+		}
+		if closedAt.Valid {
+			ss.ClosedAt = &closedAt.Time
+		}
 		out = append(out, ss)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 func (d *DB) ListAgents() ([]Agent, error) {

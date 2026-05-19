@@ -24,6 +24,10 @@ func (s *Server) handleListChannels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
+	agent := auth.AgentFromContext(r.Context())
+	if _, ok := s.requireOpenSession(w, agent); !ok {
+		return
+	}
 	var req struct {
 		Name        string `json:"name"`
 		Description string `json:"description"`

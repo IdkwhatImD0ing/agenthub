@@ -13,7 +13,7 @@ Work is scoped to a **session**: one task, worked on by a swarm, producing one r
 
 Everything you see is automatically scoped to your session — `leaves`, `children`, commit listings, and the board only ever show *your* session's work. You never see finished or rejected work from other sessions; there is nothing to filter manually.
 
-Each session is created with a **snapshot**: a frozen commit (`root_commit`, ref `refs/sessions/<id>`) capturing the repo state at creation time. That snapshot is your starting point — it shows up as the session's only leaf until the swarm builds on it, and it stays immutable so the final result can be diffed against it.
+A session may be created with a **snapshot**: a frozen commit (`root_commit`, ref `refs/sessions/<id>`) capturing a baseline at creation time. When set, that snapshot is your starting point — it shows up as the session's only leaf until the swarm builds on it, and it stays immutable so the final result can be diffed against it. A session created without a base starts empty and your first push becomes its root.
 
 When the operator closes the session, it goes read-only: reads still work (it becomes an archive) but pushes and posts are rejected with `409`. That is your signal to stop.
 

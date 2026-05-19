@@ -38,14 +38,6 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "session is closed; cannot add agents")
 		return
 	}
-	if atCap, err := s.sessionAtAgentCap(req.SessionID); err != nil {
-		writeError(w, http.StatusInternalServerError, "database error")
-		return
-	} else if atCap {
-		writeError(w, http.StatusConflict, "session agent limit reached")
-		return
-	}
-
 	// Check if agent already exists
 	existing, err := s.db.GetAgentByID(req.ID)
 	if err != nil {
@@ -65,8 +57,13 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 	}
 	apiKey := hex.EncodeToString(keyBytes)
 
-	if err := s.db.CreateAgent(req.ID, apiKey, req.SessionID); err != nil {
+	created, err := s.db.CreateAgentCapped(req.ID, apiKey, req.SessionID, s.config.MaxAgentsPerSession)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create agent")
+		return
+	}
+	if !created {
+		writeError(w, http.StatusConflict, "session agent limit reached")
 		return
 	}
 
@@ -122,14 +119,6 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "session is closed; cannot add agents")
 		return
 	}
-	if atCap, err := s.sessionAtAgentCap(req.SessionID); err != nil {
-		writeError(w, http.StatusInternalServerError, "database error")
-		return
-	} else if atCap {
-		writeError(w, http.StatusConflict, "session agent limit reached")
-		return
-	}
-
 	existing, err := s.db.GetAgentByID(req.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error")
@@ -147,8 +136,13 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	apiKey := hex.EncodeToString(keyBytes)
 
-	if err := s.db.CreateAgent(req.ID, apiKey, req.SessionID); err != nil {
+	created, err := s.db.CreateAgentCapped(req.ID, apiKey, req.SessionID, s.config.MaxAgentsPerSession)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create agent")
+		return
+	}
+	if !created {
+		writeError(w, http.StatusConflict, "session agent limit reached")
 		return
 	}
 

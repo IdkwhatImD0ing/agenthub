@@ -561,7 +561,7 @@ func cmdSessionCreate(args []string) {
 	adminKey := fs.String("admin-key", "", "admin key")
 	task := fs.String("task", "", "task description for the swarm")
 	id := fs.String("id", "", "optional explicit session id")
-	base := fs.String("base", "", "commit hash to snapshot (default: latest in hub)")
+	base := fs.String("base", "", "commit hash to snapshot (optional; omitted = session starts empty)")
 	fs.Parse(args)
 
 	if *task == "" {
@@ -581,7 +581,7 @@ func cmdSessionCreate(args []string) {
 	if rc := str(sess["root_commit"]); rc != "" {
 		fmt.Printf("snapshot: %s (frozen at refs/sessions/%v)\n", rc, sess["id"])
 	} else {
-		fmt.Println("snapshot: (none — hub was empty; first push becomes the root)")
+		fmt.Println("snapshot: (none — no --base given; first push becomes the root)")
 	}
 	fmt.Printf("\nprovision agents with:\n  ah join --server %s --name <id> --admin-key <key> --session %v\n",
 		strings.TrimRight(*server, "/"), sess["id"])

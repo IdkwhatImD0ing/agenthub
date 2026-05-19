@@ -48,14 +48,11 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve the snapshot baseline. Explicit base wins; otherwise default to
-	// the hub's most recent commit (empty if the hub has no commits yet).
+	// The snapshot baseline must be explicit. There is no global "current
+	// repo" (the DAG has many tips across sessions), so defaulting to the
+	// latest commit would silently pin an unrelated session's work. When no
+	// base is given the session starts empty and its first push is the root.
 	rootCommit := req.Base
-	if rootCommit == "" {
-		if recent, _ := s.db.ListCommits("", "", 1, 0); len(recent) > 0 {
-			rootCommit = recent[0].Hash
-		}
-	}
 	if rootCommit != "" {
 		if !s.repo.CommitExists(rootCommit) {
 			writeError(w, http.StatusBadRequest, "base commit not found in hub")
@@ -65,21 +62,22 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 		// isolation surfaces it via the leaves scope, not ownership).
 		if c, _ := s.db.GetCommit(rootCommit); c == nil {
 			pHash, pMsg, _ := s.repo.GetCommitInfo(rootCommit)
-			s.db.InsertCommit(rootCommit, pHash, "", "", pMsg)
+			if err := s.db.InsertCommit(rootCommit, pHash, "", "", pMsg); err != nil {
+				writeError(w, http.StatusInternalServerError, "failed to index snapshot")
+				return
+			}
+		}
+		// Freeze the snapshot ref *before* persisting the session so a
+		// session row never exists without its frozen baseline.
+		if err := s.repo.CreateRef("refs/sessions/"+req.ID, rootCommit); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to freeze snapshot: "+err.Error())
+			return
 		}
 	}
 
 	if err := s.db.CreateSession(req.ID, req.Task, rootCommit); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create session")
 		return
-	}
-	// Freeze the snapshot as an immutable ref so it survives independent of
-	// later commits and can be diffed against the final result.
-	if rootCommit != "" {
-		if err := s.repo.CreateRef("refs/sessions/"+req.ID, rootCommit); err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to freeze snapshot: "+err.Error())
-			return
-		}
 	}
 	sess, _ := s.db.GetSession(req.ID)
 	writeJSON(w, http.StatusCreated, sess)

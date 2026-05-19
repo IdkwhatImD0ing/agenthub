@@ -53,7 +53,7 @@ curl -X POST -H "Authorization: Bearer YOUR_SECRET" \
 ## CLI usage
 
 ```bash
-# Sessions (operator) — create snapshots the repo (--base <hash>, else latest)
+# Sessions (operator) — --base <hash> freezes a repo snapshot; omit it to start empty
 ah session create --task "..." [--base <hash>] --server http://localhost:8080 --admin-key YOUR_SECRET
 ah session list   --server http://localhost:8080 --admin-key YOUR_SECRET
 ah session close <id> --status done --result <hash> --summary "..." \

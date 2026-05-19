@@ -134,17 +134,17 @@ func (s *Server) requireSession(w http.ResponseWriter, agent *db.Agent) (string,
 	return agent.SessionID, true
 }
 
-// sessionAtAgentCap reports whether the session already holds the configured
-// maximum number of agents (0 = unlimited).
-func (s *Server) sessionAtAgentCap(sessionID string) (bool, error) {
-	if s.config.MaxAgentsPerSession <= 0 {
-		return false, nil
+// sessionScope resolves the caller's session id and snapshot root for
+// commit-visibility checks. Reads against closed sessions stay allowed.
+func (s *Server) sessionScope(w http.ResponseWriter, agent *db.Agent) (sessionID, rootCommit string, ok bool) {
+	sessionID, ok = s.requireSession(w, agent)
+	if !ok {
+		return "", "", false
 	}
-	n, err := s.db.CountAgentsInSession(sessionID)
-	if err != nil {
-		return false, err
+	if sess, _ := s.db.GetSession(sessionID); sess != nil {
+		rootCommit = sess.RootCommit
 	}
-	return n >= s.config.MaxAgentsPerSession, nil
+	return sessionID, rootCommit, true
 }
 
 func decodeJSON(r *http.Request, v any) error {
