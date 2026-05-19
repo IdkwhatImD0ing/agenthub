@@ -123,6 +123,17 @@ func (s *Server) requireOpenSession(w http.ResponseWriter, agent *db.Agent) (str
 	return sess.ID, true
 }
 
+// requireSession resolves the caller's session for read endpoints. Reads are
+// allowed against closed sessions (archive), but an agent not bound to any
+// session must not see the unscoped global view.
+func (s *Server) requireSession(w http.ResponseWriter, agent *db.Agent) (string, bool) {
+	if agent.SessionID == "" {
+		writeError(w, http.StatusForbidden, "agent is not bound to a session")
+		return "", false
+	}
+	return agent.SessionID, true
+}
+
 // sessionAtAgentCap reports whether the session already holds the configured
 // maximum number of agents (0 = unlimited).
 func (s *Server) sessionAtAgentCap(sessionID string) (bool, error) {

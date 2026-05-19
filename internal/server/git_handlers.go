@@ -131,11 +131,15 @@ func (s *Server) handleGitFetch(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleListCommits(w http.ResponseWriter, r *http.Request) {
 	agent := auth.AgentFromContext(r.Context())
+	sessionID, ok := s.requireSession(w, agent)
+	if !ok {
+		return
+	}
 	agentID := r.URL.Query().Get("agent")
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 
-	commits, err := s.db.ListCommits(agentID, agent.SessionID, limit, offset)
+	commits, err := s.db.ListCommits(agentID, sessionID, limit, offset)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error")
 		return
@@ -167,13 +171,17 @@ func (s *Server) handleGetCommit(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetChildren(w http.ResponseWriter, r *http.Request) {
 	agent := auth.AgentFromContext(r.Context())
+	sessionID, ok := s.requireSession(w, agent)
+	if !ok {
+		return
+	}
 	hash := r.PathValue("hash")
 	if !gitrepo.IsValidHash(hash) {
 		writeError(w, http.StatusBadRequest, "invalid hash")
 		return
 	}
 
-	children, err := s.db.GetChildren(hash, agent.SessionID)
+	children, err := s.db.GetChildren(hash, sessionID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error")
 		return
@@ -204,13 +212,15 @@ func (s *Server) handleGetLineage(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetLeaves(w http.ResponseWriter, r *http.Request) {
 	agent := auth.AgentFromContext(r.Context())
-	var rootCommit string
-	if agent.SessionID != "" {
-		if sess, _ := s.db.GetSession(agent.SessionID); sess != nil {
-			rootCommit = sess.RootCommit
-		}
+	sessionID, ok := s.requireSession(w, agent)
+	if !ok {
+		return
 	}
-	leaves, err := s.db.GetLeaves(agent.SessionID, rootCommit)
+	var rootCommit string
+	if sess, _ := s.db.GetSession(sessionID); sess != nil {
+		rootCommit = sess.RootCommit
+	}
+	leaves, err := s.db.GetLeaves(sessionID, rootCommit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error")
 		return

@@ -229,7 +229,12 @@ func (d *DB) CloseSession(id, status, result string) error {
 // --- Agents ---
 
 func (d *DB) CreateAgent(id, apiKey, sessionID string) error {
-	_, err := d.db.Exec("INSERT INTO agents (id, api_key, session_id) VALUES (?, ?, ?)", id, apiKey, sessionID)
+	// Store NULL (not "") when unbound so the sessions foreign key holds.
+	var sess any
+	if sessionID != "" {
+		sess = sessionID
+	}
+	_, err := d.db.Exec("INSERT INTO agents (id, api_key, session_id) VALUES (?, ?, ?)", id, apiKey, sess)
 	return err
 }
 
@@ -260,25 +265,32 @@ func (d *DB) GetAgentByID(id string) (*Agent, error) {
 // --- Commits ---
 
 func (d *DB) InsertCommit(hash, parentHash, agentID, sessionID, message string) error {
+	// Seed/ancestor commits have no author; store NULL so the agents
+	// foreign key is not violated (empty string would not match any agent).
+	var agent any
+	if agentID != "" {
+		agent = agentID
+	}
 	_, err := d.db.Exec(
 		"INSERT INTO commits (hash, parent_hash, agent_id, session_id, message) VALUES (?, ?, ?, ?, ?)",
-		hash, parentHash, agentID, sessionID, message,
+		hash, parentHash, agent, sessionID, message,
 	)
 	return err
 }
 
 func (d *DB) GetCommit(hash string) (*Commit, error) {
 	var c Commit
-	var parentHash, sessionID sql.NullString
+	var parentHash, agentID, sessionID sql.NullString
 	err := d.db.QueryRow(
 		"SELECT hash, parent_hash, agent_id, session_id, message, created_at FROM commits WHERE hash = ?", hash,
-	).Scan(&c.Hash, &parentHash, &c.AgentID, &sessionID, &c.Message, &c.CreatedAt)
+	).Scan(&c.Hash, &parentHash, &agentID, &sessionID, &c.Message, &c.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if parentHash.Valid {
 		c.ParentHash = parentHash.String
 	}
+	c.AgentID = agentID.String
 	c.SessionID = sessionID.String
 	return &c, err
 }
@@ -384,13 +396,14 @@ func scanCommits(rows *sql.Rows) ([]Commit, error) {
 	var commits []Commit
 	for rows.Next() {
 		var c Commit
-		var parentHash, sessionID sql.NullString
-		if err := rows.Scan(&c.Hash, &parentHash, &c.AgentID, &sessionID, &c.Message, &c.CreatedAt); err != nil {
+		var parentHash, agentID, sessionID sql.NullString
+		if err := rows.Scan(&c.Hash, &parentHash, &agentID, &sessionID, &c.Message, &c.CreatedAt); err != nil {
 			return nil, err
 		}
 		if parentHash.Valid {
 			c.ParentHash = parentHash.String
 		}
+		c.AgentID = agentID.String
 		c.SessionID = sessionID.String
 		commits = append(commits, c)
 	}
