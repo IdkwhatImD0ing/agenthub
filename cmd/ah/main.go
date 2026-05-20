@@ -20,9 +20,15 @@ type CLIConfig struct {
 	ServerURL string `json:"server_url"`
 	APIKey    string `json:"api_key"`
 	AgentID   string `json:"agent_id"`
+	SessionID string `json:"session_id"`
 }
 
 func configDir() string {
+	// AGENTHUB_CONFIG_DIR lets a swarm spawner give each worker its own
+	// config without having to fake $HOME for every process.
+	if d := os.Getenv("AGENTHUB_CONFIG_DIR"); d != "" {
+		return d
+	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".agenthub")
 }
@@ -131,17 +137,19 @@ func cmdJoin(args []string) {
 	serverFlag := fs.String("server", "", "server URL")
 	agentID := fs.String("name", "", "agent name/id")
 	adminKey := fs.String("admin-key", "", "admin key to register agent")
-	fs.Parse(args)
+	sessionID := fs.String("session", "", "session id to bind this agent to")
+	positional := parseFlexible(fs, args)
 
 	// Accept server URL as flag or positional arg
 	serverURL := *serverFlag
-	if serverURL == "" && fs.NArg() > 0 {
-		serverURL = fs.Arg(0)
+	if serverURL == "" && len(positional) > 0 {
+		serverURL = positional[0]
 	}
 	serverURL = strings.TrimRight(serverURL, "/")
 
-	if serverURL == "" || *agentID == "" || *adminKey == "" {
-		fmt.Fprintln(os.Stderr, "usage: ah join --server <url> --name <id> --admin-key <key>")
+	if serverURL == "" || *agentID == "" || *sessionID == "" {
+		fmt.Fprintln(os.Stderr, "usage: ah join --server <url> --name <id> --session <session-id> [--admin-key <key>]")
+		fmt.Fprintln(os.Stderr, "  --admin-key is required only when the server enforces auth")
 		os.Exit(1)
 	}
 
@@ -151,7 +159,10 @@ func cmdJoin(args []string) {
 		APIKey:  *adminKey,
 		HTTP:    &http.Client{Timeout: 30 * time.Second},
 	}
-	resp, err := client.postJSON("/api/admin/agents", map[string]string{"id": *agentID})
+	resp, err := client.postJSON("/api/admin/agents", map[string]string{
+		"id":         *agentID,
+		"session_id": *sessionID,
+	})
 	if err != nil {
 		fatal("failed to register: %v", err)
 	}
@@ -165,12 +176,13 @@ func cmdJoin(args []string) {
 		ServerURL: serverURL,
 		APIKey:    apiKey,
 		AgentID:   *agentID,
+		SessionID: *sessionID,
 	}
 	if err := saveConfig(cfg); err != nil {
 		fatal("failed to save config: %v", err)
 	}
 
-	fmt.Printf("joined %s as %q\n", serverURL, *agentID)
+	fmt.Printf("joined %s as %q (session %s)\n", serverURL, *agentID, *sessionID)
 	fmt.Printf("api key: %s\n", apiKey)
 	fmt.Printf("config saved to %s\n", configPath())
 }
@@ -412,13 +424,13 @@ func cmdPost(args []string) {
 func cmdRead(args []string) {
 	fs := flag.NewFlagSet("read", flag.ExitOnError)
 	limit := fs.Int("limit", 20, "max posts")
-	fs.Parse(args)
+	positional := parseFlexible(fs, args)
 
-	if fs.NArg() < 1 {
+	if len(positional) < 1 {
 		fmt.Fprintln(os.Stderr, "usage: ah read <channel> [--limit N]")
 		os.Exit(1)
 	}
-	channel := fs.Arg(0)
+	channel := positional[0]
 
 	cfg := mustLoadConfig()
 	client := newClient(cfg)
@@ -515,6 +527,198 @@ func cmdReply(args []string) {
 	fmt.Printf("replied #%v to #%d in #%s\n", result["id"], postID, channelName)
 }
 
+// Session commands (operator-owned lifecycle)
+
+func cmdSession(args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: ah session <create|list|close|show> ...")
+		os.Exit(1)
+	}
+	switch args[0] {
+	case "create":
+		cmdSessionCreate(args[1:])
+	case "list":
+		cmdSessionList(args[1:])
+	case "close":
+		cmdSessionClose(args[1:])
+	case "delete":
+		cmdSessionDelete(args[1:])
+	case "show":
+		cmdSessionShow(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "unknown session subcommand: %s\n", args[0])
+		os.Exit(1)
+	}
+}
+
+func adminClient(server, adminKey string) *Client {
+	// --admin-key is optional: a --no-auth server ignores it. If the server
+	// enforces auth and the key is missing/wrong, requests will fail with 401.
+	if server == "" {
+		fmt.Fprintln(os.Stderr, "--server is required")
+		os.Exit(1)
+	}
+	return &Client{
+		BaseURL: strings.TrimRight(server, "/"),
+		APIKey:  adminKey,
+		HTTP:    &http.Client{Timeout: 30 * time.Second},
+	}
+}
+
+func cmdSessionCreate(args []string) {
+	fs := flag.NewFlagSet("session create", flag.ExitOnError)
+	server := fs.String("server", "", "server URL")
+	adminKey := fs.String("admin-key", "", "admin key")
+	task := fs.String("task", "", "task description for the swarm")
+	id := fs.String("id", "", "optional explicit session id")
+	base := fs.String("base", "", "commit hash to snapshot (optional; omitted = session starts empty)")
+	fs.Parse(args)
+
+	if *task == "" {
+		fatal("--task is required")
+	}
+	client := adminClient(*server, *adminKey)
+	resp, err := client.postJSON("/api/admin/sessions", map[string]string{"id": *id, "task": *task, "base": *base})
+	if err != nil {
+		fatal("create failed: %v", err)
+	}
+	var sess map[string]any
+	if err := readJSON(resp, &sess); err != nil {
+		fatal("create failed: %v", err)
+	}
+	fmt.Printf("session %v created (status=%v)\n", sess["id"], sess["status"])
+	fmt.Printf("task: %v\n", sess["task"])
+	if rc := str(sess["root_commit"]); rc != "" {
+		fmt.Printf("snapshot: %s (frozen at refs/sessions/%v)\n", rc, sess["id"])
+	} else {
+		fmt.Println("snapshot: (none — no --base given; first push becomes the root)")
+	}
+	hint := fmt.Sprintf("ah join --server %s --name <id> --session %v", strings.TrimRight(*server, "/"), sess["id"])
+	if *adminKey != "" {
+		hint += " --admin-key <key>"
+	}
+	fmt.Printf("\nprovision agents with:\n  %s\n", hint)
+}
+
+func cmdSessionList(args []string) {
+	fs := flag.NewFlagSet("session list", flag.ExitOnError)
+	server := fs.String("server", "", "server URL")
+	adminKey := fs.String("admin-key", "", "admin key")
+	fs.Parse(args)
+
+	client := adminClient(*server, *adminKey)
+	resp, err := client.get("/api/admin/sessions")
+	if err != nil {
+		fatal("request failed: %v", err)
+	}
+	var sessions []map[string]any
+	if err := readJSON(resp, &sessions); err != nil {
+		fatal("failed: %v", err)
+	}
+	if len(sessions) == 0 {
+		fmt.Println("no sessions")
+		return
+	}
+	for _, s := range sessions {
+		fmt.Printf("%-16v %-7v agents=%v commits=%v posts=%v  %s\n",
+			s["id"], s["status"], s["AgentCount"], s["CommitCount"], s["PostCount"], str(s["task"]))
+	}
+}
+
+func cmdSessionClose(args []string) {
+	fs := flag.NewFlagSet("session close", flag.ExitOnError)
+	server := fs.String("server", "", "server URL")
+	adminKey := fs.String("admin-key", "", "admin key")
+	status := fs.String("status", "done", "done | failed")
+	commit := fs.String("result", "", "final result commit hash")
+	summary := fs.String("summary", "", "result summary")
+	positional := parseFlexible(fs, args)
+
+	if len(positional) < 1 {
+		fatal("usage: ah session close <session-id> [--status done|failed] [--result <hash>] [--summary ...]")
+	}
+	client := adminClient(*server, *adminKey)
+	resp, err := client.postJSON("/api/admin/sessions/"+positional[0]+"/close", map[string]string{
+		"status":  *status,
+		"commit":  *commit,
+		"summary": *summary,
+	})
+	if err != nil {
+		fatal("close failed: %v", err)
+	}
+	var sess map[string]any
+	if err := readJSON(resp, &sess); err != nil {
+		fatal("close failed: %v", err)
+	}
+	fmt.Printf("session %v closed (status=%v)\n", sess["id"], sess["status"])
+}
+
+func cmdSessionDelete(args []string) {
+	fs := flag.NewFlagSet("session delete", flag.ExitOnError)
+	server := fs.String("server", "", "server URL")
+	adminKey := fs.String("admin-key", "", "admin key (omit when targeting a --no-auth server)")
+	yes := fs.Bool("yes", false, "skip confirmation")
+	positional := parseFlexible(fs, args)
+
+	if len(positional) < 1 {
+		fatal("usage: ah session delete <session-id> [--yes]")
+	}
+	id := positional[0]
+	if !*yes {
+		fmt.Fprintf(os.Stderr, "delete session %s and all its agents/commits/posts? [y/N]: ", id)
+		var ans string
+		fmt.Scanln(&ans)
+		if ans != "y" && ans != "Y" {
+			fmt.Println("aborted")
+			return
+		}
+	}
+	client := &Client{
+		BaseURL: strings.TrimRight(*server, "/"),
+		APIKey:  *adminKey,
+		HTTP:    &http.Client{Timeout: 30 * time.Second},
+	}
+	req, err := http.NewRequest("DELETE", client.BaseURL+"/api/admin/sessions/"+id, nil)
+	if err != nil {
+		fatal("request: %v", err)
+	}
+	if client.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+client.APIKey)
+	}
+	resp, err := client.HTTP.Do(req)
+	if err != nil {
+		fatal("delete failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		fatal("delete failed: %d %s", resp.StatusCode, string(body))
+	}
+	fmt.Printf("session %s deleted\n", id)
+}
+
+func cmdSessionShow(args []string) {
+	cfg := mustLoadConfig()
+	client := newClient(cfg)
+	resp, err := client.get("/api/session")
+	if err != nil {
+		fatal("request failed: %v", err)
+	}
+	var sess map[string]any
+	if err := readJSON(resp, &sess); err != nil {
+		fatal("failed: %v", err)
+	}
+	fmt.Printf("session:  %v\n", sess["id"])
+	fmt.Printf("status:   %v\n", sess["status"])
+	fmt.Printf("task:     %v\n", sess["task"])
+	if rc := str(sess["root_commit"]); rc != "" {
+		fmt.Printf("snapshot: %s\n", rc)
+	}
+	if r := str(sess["result"]); r != "" {
+		fmt.Printf("result:   %s\n", r)
+	}
+}
+
 // Helpers
 
 func mustLoadConfig() *CLIConfig {
@@ -523,6 +727,50 @@ func mustLoadConfig() *CLIConfig {
 		fatal("%v", err)
 	}
 	return cfg
+}
+
+// parseFlexible parses args allowing positionals to appear before, after, or
+// interleaved with flags. The stdlib flag package stops at the first non-flag
+// token, which is a foot-gun for subcommands like `ah session close <id>
+// --status done`. We split args into flag tokens and positionals, hand only
+// the flag tokens to Parse, and expose the positionals back to the caller.
+func parseFlexible(fs *flag.FlagSet, args []string) []string {
+	var positionals, flagArgs []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			// Everything after `--` is positional, per Unix convention.
+			positionals = append(positionals, args[i+1:]...)
+			break
+		}
+		if !strings.HasPrefix(a, "-") {
+			positionals = append(positionals, a)
+			continue
+		}
+		flagArgs = append(flagArgs, a)
+		// `--flag=value` carries its value inline; `--flag value` needs the
+		// next arg too, *unless* the flag is bool.
+		if strings.Contains(a, "=") {
+			continue
+		}
+		name := strings.TrimLeft(a, "-")
+		f := fs.Lookup(name)
+		if f == nil {
+			// Unknown flag — let Parse complain with its own error message.
+			continue
+		}
+		if bf, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && bf.IsBoolFlag() {
+			continue
+		}
+		if i+1 < len(args) {
+			i++
+			flagArgs = append(flagArgs, args[i])
+		}
+	}
+	if err := fs.Parse(flagArgs); err != nil {
+		os.Exit(2)
+	}
+	return positionals
 }
 
 func fatal(format string, args ...any) {
@@ -586,6 +834,8 @@ func main() {
 	switch cmd {
 	case "join":
 		cmdJoin(args)
+	case "session":
+		cmdSession(args)
 	case "push":
 		cmdPush(args)
 	case "fetch":
@@ -618,8 +868,17 @@ func main() {
 func printUsage() {
 	fmt.Println(`ah — CLI for Agent Hub
 
+Session commands (operator):
+  session create --task "..." --server <url> [--admin-key <k>] [--base <hash>]
+  session list   --server <url> [--admin-key <k>]
+  session close  <id> [--status done|failed] [--result <hash>] [--summary ...]
+  session delete <id> [--yes]                 remove session + its agents/commits/posts
+  session show                                show this agent's session
+
+  (--admin-key is optional against a --no-auth server.)
+
 Git commands:
-  join <url> --name <id> --admin-key <key>   register as agent
+  join --server <url> --name <id> --session <id> [--admin-key <k>]   register as agent
   push                                        push HEAD commit to hub
   fetch <hash>                                fetch a commit from hub
   log [--agent X] [--limit N]                 list recent commits

@@ -14,6 +14,11 @@ import (
 func (s *Server) handleGitPush(w http.ResponseWriter, r *http.Request) {
 	agent := auth.AgentFromContext(r.Context())
 
+	sessionID, ok := s.requireOpenSession(w, agent)
+	if !ok {
+		return
+	}
+
 	// Rate limit check
 	allowed, err := s.db.CheckRateLimit(agent.ID, "push", s.config.MaxPushesPerHour)
 	if err != nil {
@@ -81,11 +86,11 @@ func (s *Server) handleGitPush(w http.ResponseWriter, r *http.Request) {
 		if parentHash != "" {
 			if pc, _ := s.db.GetCommit(parentHash); pc == nil {
 				pParent, pMsg, _ := s.repo.GetCommitInfo(parentHash)
-				s.db.InsertCommit(parentHash, pParent, "", pMsg)
+				s.db.InsertCommit(parentHash, pParent, "", "", pMsg)
 			}
 		}
 
-		if err := s.db.InsertCommit(hash, parentHash, agent.ID, message); err != nil {
+		if err := s.db.InsertCommit(hash, parentHash, agent.ID, sessionID, message); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to index commit")
 			return
 		}
@@ -101,9 +106,21 @@ func (s *Server) handleGitPush(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGitFetch(w http.ResponseWriter, r *http.Request) {
+	agent := auth.AgentFromContext(r.Context())
+	sessionID, rootCommit, ok := s.sessionScope(w, agent)
+	if !ok {
+		return
+	}
 	hash := r.PathValue("hash")
 	if !gitrepo.IsValidHash(hash) {
 		writeError(w, http.StatusBadRequest, "invalid hash")
+		return
+	}
+	if visible, err := s.db.CommitVisibleInSession(hash, sessionID, rootCommit); err != nil {
+		writeError(w, http.StatusInternalServerError, "database error")
+		return
+	} else if !visible {
+		writeError(w, http.StatusNotFound, "commit not found")
 		return
 	}
 
@@ -125,11 +142,16 @@ func (s *Server) handleGitFetch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListCommits(w http.ResponseWriter, r *http.Request) {
+	agent := auth.AgentFromContext(r.Context())
+	sessionID, ok := s.requireSession(w, agent)
+	if !ok {
+		return
+	}
 	agentID := r.URL.Query().Get("agent")
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 
-	commits, err := s.db.ListCommits(agentID, limit, offset)
+	commits, err := s.db.ListCommits(agentID, sessionID, limit, offset)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error")
 		return
@@ -141,6 +163,11 @@ func (s *Server) handleListCommits(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetCommit(w http.ResponseWriter, r *http.Request) {
+	agent := auth.AgentFromContext(r.Context())
+	sessionID, rootCommit, ok := s.sessionScope(w, agent)
+	if !ok {
+		return
+	}
 	hash := r.PathValue("hash")
 	if !gitrepo.IsValidHash(hash) {
 		writeError(w, http.StatusBadRequest, "invalid hash")
@@ -152,7 +179,7 @@ func (s *Server) handleGetCommit(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "database error")
 		return
 	}
-	if commit == nil {
+	if commit == nil || (commit.SessionID != sessionID && commit.Hash != rootCommit) {
 		writeError(w, http.StatusNotFound, "commit not found")
 		return
 	}
@@ -160,13 +187,18 @@ func (s *Server) handleGetCommit(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetChildren(w http.ResponseWriter, r *http.Request) {
+	agent := auth.AgentFromContext(r.Context())
+	sessionID, ok := s.requireSession(w, agent)
+	if !ok {
+		return
+	}
 	hash := r.PathValue("hash")
 	if !gitrepo.IsValidHash(hash) {
 		writeError(w, http.StatusBadRequest, "invalid hash")
 		return
 	}
 
-	children, err := s.db.GetChildren(hash)
+	children, err := s.db.GetChildren(hash, sessionID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error")
 		return
@@ -178,13 +210,18 @@ func (s *Server) handleGetChildren(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetLineage(w http.ResponseWriter, r *http.Request) {
+	agent := auth.AgentFromContext(r.Context())
+	sessionID, rootCommit, ok := s.sessionScope(w, agent)
+	if !ok {
+		return
+	}
 	hash := r.PathValue("hash")
 	if !gitrepo.IsValidHash(hash) {
 		writeError(w, http.StatusBadRequest, "invalid hash")
 		return
 	}
 
-	lineage, err := s.db.GetLineage(hash)
+	lineage, err := s.db.GetLineageScoped(hash, sessionID, rootCommit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error")
 		return
@@ -196,7 +233,12 @@ func (s *Server) handleGetLineage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetLeaves(w http.ResponseWriter, r *http.Request) {
-	leaves, err := s.db.GetLeaves()
+	agent := auth.AgentFromContext(r.Context())
+	sessionID, rootCommit, ok := s.sessionScope(w, agent)
+	if !ok {
+		return
+	}
+	leaves, err := s.db.GetLeaves(sessionID, rootCommit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error")
 		return
@@ -209,6 +251,10 @@ func (s *Server) handleGetLeaves(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDiff(w http.ResponseWriter, r *http.Request) {
 	agent := auth.AgentFromContext(r.Context())
+	sessionID, rootCommit, ok := s.sessionScope(w, agent)
+	if !ok {
+		return
+	}
 	// Rate limit diffs (CPU-expensive)
 	allowed, _ := s.db.CheckRateLimit(agent.ID, "diff", 60)
 	if !allowed {
@@ -221,6 +267,15 @@ func (s *Server) handleDiff(w http.ResponseWriter, r *http.Request) {
 	if !gitrepo.IsValidHash(hashA) || !gitrepo.IsValidHash(hashB) {
 		writeError(w, http.StatusBadRequest, "invalid hash")
 		return
+	}
+	for _, h := range []string{hashA, hashB} {
+		if visible, err := s.db.CommitVisibleInSession(h, sessionID, rootCommit); err != nil {
+			writeError(w, http.StatusInternalServerError, "database error")
+			return
+		} else if !visible {
+			writeError(w, http.StatusNotFound, "commit not found")
+			return
+		}
 	}
 
 	diff, err := s.repo.Diff(hashA, hashB)

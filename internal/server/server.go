@@ -12,10 +12,12 @@ import (
 )
 
 type Config struct {
-	MaxBundleSize    int64  // max bundle upload size in bytes
-	MaxPushesPerHour int    // per agent
-	MaxPostsPerHour  int    // per agent
-	ListenAddr       string // e.g. ":8080"
+	MaxBundleSize       int64  // max bundle upload size in bytes
+	MaxPushesPerHour    int    // per agent
+	MaxPostsPerHour     int    // per agent
+	MaxAgentsPerSession int    // 0 = unlimited
+	NoAuth              bool   // local mode: skip admin-key checks, open dashboard mutations
+	ListenAddr          string // e.g. ":8080"
 }
 
 type Server struct {
@@ -41,6 +43,11 @@ func New(database *db.DB, repo *gitrepo.Repo, adminKey string, cfg Config) *Serv
 func (s *Server) setupRoutes() {
 	authMw := auth.Middleware(s.db)
 	adminMw := auth.AdminMiddleware(s.adminKey)
+	if s.config.NoAuth {
+		// Local mode: operator-only endpoints are open. Per-agent bearer auth
+		// stays in place because the swarm still needs distinct identities.
+		adminMw = func(h http.Handler) http.Handler { return h }
+	}
 
 	// Git endpoints
 	s.mux.Handle("POST /api/git/push", authMw(http.HandlerFunc(s.handleGitPush)))
@@ -60,8 +67,22 @@ func (s *Server) setupRoutes() {
 	s.mux.Handle("GET /api/posts/{id}", authMw(http.HandlerFunc(s.handleGetPost)))
 	s.mux.Handle("GET /api/posts/{id}/replies", authMw(http.HandlerFunc(s.handleGetReplies)))
 
+	// Session endpoints
+	s.mux.Handle("GET /api/session", authMw(http.HandlerFunc(s.handleGetCurrentSession)))
+	s.mux.Handle("GET /api/sessions/{id}", authMw(http.HandlerFunc(s.handleGetSession)))
+
 	// Admin endpoints
 	s.mux.Handle("POST /api/admin/agents", adminMw(http.HandlerFunc(s.handleCreateAgent)))
+	s.mux.Handle("POST /api/admin/sessions", adminMw(http.HandlerFunc(s.handleCreateSession)))
+	s.mux.Handle("GET /api/admin/sessions", adminMw(http.HandlerFunc(s.handleListSessions)))
+	s.mux.Handle("POST /api/admin/sessions/{id}/close", adminMw(http.HandlerFunc(s.handleCloseSession)))
+	s.mux.Handle("DELETE /api/admin/sessions/{id}", adminMw(http.HandlerFunc(s.handleDeleteSession)))
+
+	// Dashboard form actions (operator). Same admin middleware so a non-local
+	// deploy still requires the admin bearer; in --no-auth mode they are open.
+	s.mux.Handle("POST /admin/sessions/create", adminMw(http.HandlerFunc(s.handleDashboardCreateSession)))
+	s.mux.Handle("POST /admin/sessions/{id}/close", adminMw(http.HandlerFunc(s.handleDashboardCloseSession)))
+	s.mux.Handle("POST /admin/sessions/{id}/delete", adminMw(http.HandlerFunc(s.handleDashboardDeleteSession)))
 
 	// Public registration (no auth, rate-limited by IP)
 	s.mux.HandleFunc("POST /api/register", s.handleRegister)
@@ -90,6 +111,53 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// requireOpenSession resolves the agent's session and rejects writes unless it
+// is still open. Returns the session id and false if the request was rejected.
+func (s *Server) requireOpenSession(w http.ResponseWriter, agent *db.Agent) (string, bool) {
+	if agent.SessionID == "" {
+		writeError(w, http.StatusForbidden, "agent is not bound to a session")
+		return "", false
+	}
+	sess, err := s.db.GetSession(agent.SessionID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "database error")
+		return "", false
+	}
+	if sess == nil {
+		writeError(w, http.StatusForbidden, "agent session no longer exists")
+		return "", false
+	}
+	if sess.Status != "open" {
+		writeError(w, http.StatusConflict, "session is closed ("+sess.Status+"); no further writes accepted")
+		return "", false
+	}
+	return sess.ID, true
+}
+
+// requireSession resolves the caller's session for read endpoints. Reads are
+// allowed against closed sessions (archive), but an agent not bound to any
+// session must not see the unscoped global view.
+func (s *Server) requireSession(w http.ResponseWriter, agent *db.Agent) (string, bool) {
+	if agent.SessionID == "" {
+		writeError(w, http.StatusForbidden, "agent is not bound to a session")
+		return "", false
+	}
+	return agent.SessionID, true
+}
+
+// sessionScope resolves the caller's session id and snapshot root for
+// commit-visibility checks. Reads against closed sessions stay allowed.
+func (s *Server) sessionScope(w http.ResponseWriter, agent *db.Agent) (sessionID, rootCommit string, ok bool) {
+	sessionID, ok = s.requireSession(w, agent)
+	if !ok {
+		return "", "", false
+	}
+	if sess, _ := s.db.GetSession(sessionID); sess != nil {
+		rootCommit = sess.RootCommit
+	}
+	return sessionID, rootCommit, true
 }
 
 func decodeJSON(r *http.Request, v any) error {

@@ -24,6 +24,10 @@ func (s *Server) handleListChannels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
+	agent := auth.AgentFromContext(r.Context())
+	if _, ok := s.requireOpenSession(w, agent); !ok {
+		return
+	}
 	var req struct {
 		Name        string `json:"name"`
 		Description string `json:"description"`
@@ -61,6 +65,11 @@ func (s *Server) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleListPosts(w http.ResponseWriter, r *http.Request) {
+	agent := auth.AgentFromContext(r.Context())
+	sessionID, ok := s.requireSession(w, agent)
+	if !ok {
+		return
+	}
 	name := r.PathValue("name")
 	ch, err := s.db.GetChannelByName(name)
 	if err != nil {
@@ -75,7 +84,7 @@ func (s *Server) handleListPosts(w http.ResponseWriter, r *http.Request) {
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 
-	posts, err := s.db.ListPosts(ch.ID, limit, offset)
+	posts, err := s.db.ListPosts(ch.ID, sessionID, limit, offset)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error")
 		return
@@ -90,14 +99,30 @@ func (s *Server) handleCreatePost(w http.ResponseWriter, r *http.Request) {
 	agent := auth.AgentFromContext(r.Context())
 	name := r.PathValue("name")
 
+	sessionID, ok := s.requireOpenSession(w, agent)
+	if !ok {
+		return
+	}
+
 	ch, err := s.db.GetChannelByName(name)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error")
 		return
 	}
 	if ch == nil {
-		writeError(w, http.StatusNotFound, "channel not found")
-		return
+		// Auto-create on first post. Channels are cheap and swarm-scoped;
+		// asking every worker to POST /api/channels before its first post
+		// is pure boilerplate. Listing a missing channel still 404s — only
+		// the post path implicitly creates.
+		if err := s.db.CreateChannel(name, ""); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to create channel")
+			return
+		}
+		ch, _ = s.db.GetChannelByName(name)
+		if ch == nil {
+			writeError(w, http.StatusInternalServerError, "channel disappeared after create")
+			return
+		}
 	}
 
 	// Rate limit
@@ -145,7 +170,7 @@ func (s *Server) handleCreatePost(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	post, err := s.db.CreatePost(ch.ID, agent.ID, req.ParentID, req.Content)
+	post, err := s.db.CreatePost(ch.ID, agent.ID, sessionID, req.ParentID, req.Content)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create post")
 		return
@@ -156,6 +181,11 @@ func (s *Server) handleCreatePost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetPost(w http.ResponseWriter, r *http.Request) {
+	agent := auth.AgentFromContext(r.Context())
+	sessionID, ok := s.requireSession(w, agent)
+	if !ok {
+		return
+	}
 	id, err := strconv.Atoi(r.PathValue("id"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid post id")
@@ -167,7 +197,9 @@ func (s *Server) handleGetPost(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "database error")
 		return
 	}
-	if post == nil {
+	// 404 (not 403) for posts outside the caller's session so sequential
+	// post ids cannot be used to probe other sessions' boards.
+	if post == nil || post.SessionID != sessionID {
 		writeError(w, http.StatusNotFound, "post not found")
 		return
 	}
@@ -175,19 +207,24 @@ func (s *Server) handleGetPost(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetReplies(w http.ResponseWriter, r *http.Request) {
+	agent := auth.AgentFromContext(r.Context())
+	sessionID, ok := s.requireSession(w, agent)
+	if !ok {
+		return
+	}
 	id, err := strconv.Atoi(r.PathValue("id"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid post id")
 		return
 	}
 
-	// Verify post exists
+	// Verify post exists and is in the caller's session
 	post, err := s.db.GetPost(id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error")
 		return
 	}
-	if post == nil {
+	if post == nil || post.SessionID != sessionID {
 		writeError(w, http.StatusNotFound, "post not found")
 		return
 	}
