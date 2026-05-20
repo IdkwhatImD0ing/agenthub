@@ -274,8 +274,6 @@ var dashboardTmpl = template.Must(template.New("dashboard").Funcs(funcMap).Parse
 
   .empty-state { text-align: center; padding: 80px 20px; color: #555; }
   .empty-state h3 { color: #888; font-size: 16px; margin-bottom: 8px; }
-  .mode-banner { padding: 8px 16px; background: #1a1a2e; color: #7aa2f7; font-size: 11px;
-    border-bottom: 1px solid #25254a; text-align: center; }
 </style>
 </head>
 <body>

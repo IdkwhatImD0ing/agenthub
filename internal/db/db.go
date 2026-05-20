@@ -431,23 +431,6 @@ func (d *DB) GetChildren(hash, sessionID string) ([]Commit, error) {
 	return scanCommits(rows)
 }
 
-func (d *DB) GetLineage(hash string) ([]Commit, error) {
-	var lineage []Commit
-	current := hash
-	for current != "" {
-		c, err := d.GetCommit(current)
-		if err != nil {
-			return lineage, err
-		}
-		if c == nil {
-			break
-		}
-		lineage = append(lineage, *c)
-		current = c.ParentHash
-	}
-	return lineage, nil
-}
-
 // GetLeaves returns frontier commits for a session (tips with no children).
 // The scope is the session's own commits plus its frozen root snapshot, so a
 // brand-new session's frontier is the snapshot until the swarm builds on it.
