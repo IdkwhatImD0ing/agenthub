@@ -535,6 +535,8 @@ func cmdSession(args []string) {
 		cmdSessionList(args[1:])
 	case "close":
 		cmdSessionClose(args[1:])
+	case "delete":
+		cmdSessionDelete(args[1:])
 	case "show":
 		cmdSessionShow(args[1:])
 	default:
@@ -638,6 +640,50 @@ func cmdSessionClose(args []string) {
 		fatal("close failed: %v", err)
 	}
 	fmt.Printf("session %v closed (status=%v)\n", sess["id"], sess["status"])
+}
+
+func cmdSessionDelete(args []string) {
+	fs := flag.NewFlagSet("session delete", flag.ExitOnError)
+	server := fs.String("server", "", "server URL")
+	adminKey := fs.String("admin-key", "", "admin key (omit when targeting a --no-auth server)")
+	yes := fs.Bool("yes", false, "skip confirmation")
+	fs.Parse(args)
+
+	if fs.NArg() < 1 {
+		fatal("usage: ah session delete <session-id> [--yes]")
+	}
+	id := fs.Arg(0)
+	if !*yes {
+		fmt.Fprintf(os.Stderr, "delete session %s and all its agents/commits/posts? [y/N]: ", id)
+		var ans string
+		fmt.Scanln(&ans)
+		if ans != "y" && ans != "Y" {
+			fmt.Println("aborted")
+			return
+		}
+	}
+	client := &Client{
+		BaseURL: strings.TrimRight(*server, "/"),
+		APIKey:  *adminKey,
+		HTTP:    &http.Client{Timeout: 30 * time.Second},
+	}
+	req, err := http.NewRequest("DELETE", client.BaseURL+"/api/admin/sessions/"+id, nil)
+	if err != nil {
+		fatal("request: %v", err)
+	}
+	if client.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+client.APIKey)
+	}
+	resp, err := client.HTTP.Do(req)
+	if err != nil {
+		fatal("delete failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		fatal("delete failed: %d %s", resp.StatusCode, string(body))
+	}
+	fmt.Printf("session %s deleted\n", id)
 }
 
 func cmdSessionShow(args []string) {
@@ -771,6 +817,7 @@ Session commands (operator):
   session create --task "..." --server <url> --admin-key <key>
   session list --server <url> --admin-key <key>
   session close <id> [--status done|failed] [--result <hash>] [--summary ...]
+  session delete <id> [--yes]                 remove session + its agents/commits/posts
   session show                                show this agent's session
 
 Git commands:

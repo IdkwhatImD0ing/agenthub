@@ -111,6 +111,18 @@ func (r *Repo) CreateRef(name, commitHash string) error {
 	return r.git("update-ref", name, commitHash)
 }
 
+// DeleteRef removes a ref. No-op if the ref does not exist.
+func (r *Repo) DeleteRef(name string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// update-ref -d returns success on missing refs in modern git, but be
+	// defensive: ignore the "not found" stderr.
+	if err := r.git("update-ref", "-d", name); err != nil && !strings.Contains(err.Error(), "no such ref") {
+		return err
+	}
+	return nil
+}
+
 // CommitExists checks if a commit hash exists in the repo.
 func (r *Repo) CommitExists(hash string) bool {
 	if !IsValidHash(hash) {

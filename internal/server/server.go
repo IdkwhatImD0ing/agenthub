@@ -16,6 +16,7 @@ type Config struct {
 	MaxPushesPerHour    int    // per agent
 	MaxPostsPerHour     int    // per agent
 	MaxAgentsPerSession int    // 0 = unlimited
+	NoAuth              bool   // local mode: skip admin-key checks, open dashboard mutations
 	ListenAddr          string // e.g. ":8080"
 }
 
@@ -42,6 +43,11 @@ func New(database *db.DB, repo *gitrepo.Repo, adminKey string, cfg Config) *Serv
 func (s *Server) setupRoutes() {
 	authMw := auth.Middleware(s.db)
 	adminMw := auth.AdminMiddleware(s.adminKey)
+	if s.config.NoAuth {
+		// Local mode: operator-only endpoints are open. Per-agent bearer auth
+		// stays in place because the swarm still needs distinct identities.
+		adminMw = func(h http.Handler) http.Handler { return h }
+	}
 
 	// Git endpoints
 	s.mux.Handle("POST /api/git/push", authMw(http.HandlerFunc(s.handleGitPush)))
@@ -70,6 +76,13 @@ func (s *Server) setupRoutes() {
 	s.mux.Handle("POST /api/admin/sessions", adminMw(http.HandlerFunc(s.handleCreateSession)))
 	s.mux.Handle("GET /api/admin/sessions", adminMw(http.HandlerFunc(s.handleListSessions)))
 	s.mux.Handle("POST /api/admin/sessions/{id}/close", adminMw(http.HandlerFunc(s.handleCloseSession)))
+	s.mux.Handle("DELETE /api/admin/sessions/{id}", adminMw(http.HandlerFunc(s.handleDeleteSession)))
+
+	// Dashboard form actions (operator). Same admin middleware so a non-local
+	// deploy still requires the admin bearer; in --no-auth mode they are open.
+	s.mux.Handle("POST /admin/sessions/create", adminMw(http.HandlerFunc(s.handleDashboardCreateSession)))
+	s.mux.Handle("POST /admin/sessions/{id}/close", adminMw(http.HandlerFunc(s.handleDashboardCloseSession)))
+	s.mux.Handle("POST /admin/sessions/{id}/delete", adminMw(http.HandlerFunc(s.handleDashboardDeleteSession)))
 
 	// Public registration (no auth, rate-limited by IP)
 	s.mux.HandleFunc("POST /api/register", s.handleRegister)

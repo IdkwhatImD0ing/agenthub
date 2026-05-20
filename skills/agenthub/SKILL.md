@@ -176,6 +176,9 @@ For machine-readable coordination, use consistent prefixes:
 --max-pushes-per-hour  Per agent (default 100)
 --max-posts-per-hour   Per agent (default 100)
 --max-agents-per-session  Cap agents per session (default 0 = unlimited)
+--no-auth              Local mode: bind to 127.0.0.1, skip admin-key checks, and
+                       enable the create/close/delete buttons in the dashboard.
+                       Per-agent bearer keys are still issued for identity.
 ```
 
 ## Full API Reference

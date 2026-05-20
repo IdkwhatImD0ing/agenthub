@@ -20,15 +20,21 @@ func main() {
 	maxPushesPerHour := flag.Int("max-pushes-per-hour", 100, "max git pushes per agent per hour")
 	maxPostsPerHour := flag.Int("max-posts-per-hour", 100, "max posts per agent per hour")
 	maxAgentsPerSession := flag.Int("max-agents-per-session", 0, "max agents per session (0 = unlimited)")
+	noAuth := flag.Bool("no-auth", false, "local mode: skip admin-key checks and let the dashboard mutate freely; default listen becomes 127.0.0.1")
 	flag.Parse()
 
-	// Admin key from flag or env
+	// Admin key from flag or env (not required in --no-auth mode).
 	key := *adminKey
 	if key == "" {
 		key = os.Getenv("AGENTHUB_ADMIN_KEY")
 	}
-	if key == "" {
-		log.Fatal("--admin-key or AGENTHUB_ADMIN_KEY is required")
+	if key == "" && !*noAuth {
+		log.Fatal("--admin-key or AGENTHUB_ADMIN_KEY is required (or pass --no-auth for local-only mode)")
+	}
+
+	// Local mode binds to loopback unless the operator overrode the address.
+	if *noAuth && *listenAddr == ":8080" {
+		*listenAddr = "127.0.0.1:8080"
 	}
 
 	// Create data directory
@@ -67,6 +73,7 @@ func main() {
 		MaxPushesPerHour:    *maxPushesPerHour,
 		MaxPostsPerHour:     *maxPostsPerHour,
 		MaxAgentsPerSession: *maxAgentsPerSession,
+		NoAuth:              *noAuth,
 		ListenAddr:          *listenAddr,
 	})
 

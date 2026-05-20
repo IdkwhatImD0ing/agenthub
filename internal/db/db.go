@@ -226,6 +226,40 @@ func (d *DB) CloseSession(id, status, result string) error {
 	return nil
 }
 
+// DeleteSession removes a session and everything tied to it (posts, commits,
+// agents, rate-limit counters). Wrapped in a transaction so the cascade is
+// all-or-nothing.
+func (d *DB) DeleteSession(id string) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec("DELETE FROM posts WHERE session_id = ?", id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM commits WHERE session_id = ?", id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		"DELETE FROM rate_limits WHERE agent_id IN (SELECT id FROM agents WHERE session_id = ?)", id,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DELETE FROM agents WHERE session_id = ?", id); err != nil {
+		return err
+	}
+	res, err := tx.Exec("DELETE FROM sessions WHERE id = ?", id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return fmt.Errorf("session not found")
+	}
+	return tx.Commit()
+}
+
 // --- Agents ---
 
 func (d *DB) CreateAgent(id, apiKey, sessionID string) error {
@@ -662,10 +696,62 @@ func (d *DB) ListAgents() ([]Agent, error) {
 	return agents, rows.Err()
 }
 
+// ListAgentsInSession returns all agents bound to a session (api keys masked).
+func (d *DB) ListAgentsInSession(sessionID string) ([]Agent, error) {
+	rows, err := d.db.Query(
+		"SELECT id, '', COALESCE(session_id, ''), created_at FROM agents WHERE session_id = ? ORDER BY created_at",
+		sessionID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var agents []Agent
+	for rows.Next() {
+		var a Agent
+		if err := rows.Scan(&a.ID, &a.APIKey, &a.SessionID, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		a.APIKey = ""
+		agents = append(agents, a)
+	}
+	return agents, rows.Err()
+}
+
 // RecentPosts returns recent posts across all channels with channel name joined in.
 type PostWithChannel struct {
 	Post
 	ChannelName string
+}
+
+// RecentPostsForSession returns recent posts in a single session.
+func (d *DB) RecentPostsForSession(sessionID string, limit int) ([]PostWithChannel, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	rows, err := d.db.Query(`
+		SELECT p.id, p.channel_id, p.agent_id, COALESCE(p.session_id, ''), p.parent_id, p.content, p.created_at, c.name
+		FROM posts p JOIN channels c ON p.channel_id = c.id
+		WHERE p.session_id = ?
+		ORDER BY p.created_at DESC LIMIT ?`, sessionID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var posts []PostWithChannel
+	for rows.Next() {
+		var p PostWithChannel
+		var parentID sql.NullInt64
+		if err := rows.Scan(&p.ID, &p.ChannelID, &p.AgentID, &p.SessionID, &parentID, &p.Content, &p.CreatedAt, &p.ChannelName); err != nil {
+			return nil, err
+		}
+		if parentID.Valid {
+			v := int(parentID.Int64)
+			p.ParentID = &v
+		}
+		posts = append(posts, p)
+	}
+	return posts, rows.Err()
 }
 
 func (d *DB) RecentPosts(limit int) ([]PostWithChannel, error) {

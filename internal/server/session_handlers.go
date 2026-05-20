@@ -12,75 +12,72 @@ import (
 
 var sessionIDRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$`)
 
+// createSession performs the shared open-session work used by the JSON API and
+// the dashboard form. Returns the new session, the HTTP status to use, and a
+// human error message (empty when ok).
+func (s *Server) createSession(id, task, base string) (*db.Session, int, string) {
+	if task == "" {
+		return nil, http.StatusBadRequest, "task is required"
+	}
+	if id == "" {
+		b := make([]byte, 8)
+		rand.Read(b)
+		id = "s-" + hex.EncodeToString(b)
+	}
+	if !sessionIDRe.MatchString(id) {
+		return nil, http.StatusBadRequest, "id must be 1-63 chars, alphanumeric/dash/dot/underscore, start with alphanumeric"
+	}
+	if existing, err := s.db.GetSession(id); err != nil {
+		return nil, http.StatusInternalServerError, "database error"
+	} else if existing != nil {
+		return nil, http.StatusConflict, "session already exists"
+	}
+
+	// The snapshot baseline must be explicit. There is no global "current
+	// repo" (the DAG has many tips across sessions), so defaulting would
+	// silently pin an unrelated session's work. Without --base the session
+	// starts empty and its first push becomes the root.
+	if base != "" {
+		if !s.repo.CommitExists(base) {
+			return nil, http.StatusBadRequest, "base commit not found in hub"
+		}
+		if c, _ := s.db.GetCommit(base); c == nil {
+			pHash, pMsg, _ := s.repo.GetCommitInfo(base)
+			if err := s.db.InsertCommit(base, pHash, "", "", pMsg); err != nil {
+				return nil, http.StatusInternalServerError, "failed to index snapshot"
+			}
+		}
+		// Freeze the snapshot ref *before* persisting the session so a
+		// session row never exists without its frozen baseline.
+		if err := s.repo.CreateRef("refs/sessions/"+id, base); err != nil {
+			return nil, http.StatusInternalServerError, "failed to freeze snapshot: " + err.Error()
+		}
+	}
+	if err := s.db.CreateSession(id, task, base); err != nil {
+		return nil, http.StatusInternalServerError, "failed to create session"
+	}
+	sess, _ := s.db.GetSession(id)
+	return sess, http.StatusCreated, ""
+}
+
 // handleCreateSession (admin) opens a new session for a task. The operator owns
 // session lifecycle; agents are later bound to the returned id.
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		ID   string `json:"id"`
 		Task string `json:"task"`
-		Base string `json:"base"` // optional commit hash to snapshot; defaults to latest
+		Base string `json:"base"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
-	if req.Task == "" {
-		writeError(w, http.StatusBadRequest, "task is required")
+	sess, status, errMsg := s.createSession(req.ID, req.Task, req.Base)
+	if errMsg != "" {
+		writeError(w, status, errMsg)
 		return
 	}
-	if req.ID == "" {
-		b := make([]byte, 8)
-		rand.Read(b)
-		req.ID = "s-" + hex.EncodeToString(b)
-	}
-	if !sessionIDRe.MatchString(req.ID) {
-		writeError(w, http.StatusBadRequest, "id must be 1-63 chars, alphanumeric/dash/dot/underscore, start with alphanumeric")
-		return
-	}
-
-	existing, err := s.db.GetSession(req.ID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "database error")
-		return
-	}
-	if existing != nil {
-		writeError(w, http.StatusConflict, "session already exists")
-		return
-	}
-
-	// The snapshot baseline must be explicit. There is no global "current
-	// repo" (the DAG has many tips across sessions), so defaulting to the
-	// latest commit would silently pin an unrelated session's work. When no
-	// base is given the session starts empty and its first push is the root.
-	rootCommit := req.Base
-	if rootCommit != "" {
-		if !s.repo.CommitExists(rootCommit) {
-			writeError(w, http.StatusBadRequest, "base commit not found in hub")
-			return
-		}
-		// Ensure the snapshot commit is indexed (shared seed; session
-		// isolation surfaces it via the leaves scope, not ownership).
-		if c, _ := s.db.GetCommit(rootCommit); c == nil {
-			pHash, pMsg, _ := s.repo.GetCommitInfo(rootCommit)
-			if err := s.db.InsertCommit(rootCommit, pHash, "", "", pMsg); err != nil {
-				writeError(w, http.StatusInternalServerError, "failed to index snapshot")
-				return
-			}
-		}
-		// Freeze the snapshot ref *before* persisting the session so a
-		// session row never exists without its frozen baseline.
-		if err := s.repo.CreateRef("refs/sessions/"+req.ID, rootCommit); err != nil {
-			writeError(w, http.StatusInternalServerError, "failed to freeze snapshot: "+err.Error())
-			return
-		}
-	}
-
-	if err := s.db.CreateSession(req.ID, req.Task, rootCommit); err != nil {
-		writeError(w, http.StatusInternalServerError, "failed to create session")
-		return
-	}
-	sess, _ := s.db.GetSession(req.ID)
-	writeJSON(w, http.StatusCreated, sess)
+	writeJSON(w, status, sess)
 }
 
 // handleListSessions (admin) lists all sessions with activity counts.
@@ -149,6 +146,24 @@ func (s *Server) handleGetCurrentSession(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	writeJSON(w, http.StatusOK, sess)
+}
+
+// handleDeleteSession (admin) removes a session and all its posts, commits,
+// agents, rate-limit counters, and the frozen snapshot ref.
+func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.db.DeleteSession(id); err != nil {
+		if err.Error() == "session not found" {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "delete failed: "+err.Error())
+		return
+	}
+	// Best-effort: remove the snapshot ref. The DB row is already gone, so
+	// failure here just leaves a dangling ref in the bare repo.
+	s.repo.DeleteRef("refs/sessions/" + id)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleGetSession returns any session by id (read-only; archives stay visible).

@@ -34,6 +34,15 @@ Authorization: Bearer <admin_key>
 
 Response `200`: array of session objects with `AgentCount`, `CommitCount`, `PostCount`.
 
+### Delete session (admin only)
+
+```
+DELETE /api/admin/sessions/{id}
+Authorization: Bearer <admin_key>
+```
+
+Removes the session and all its agents, commits, posts, rate-limit counters, and the frozen `refs/sessions/<id>` ref. Returns `204` on success, `404` if the session does not exist. In `--no-auth` mode the bearer token is not required.
+
 ### Close session (admin only)
 
 ```
