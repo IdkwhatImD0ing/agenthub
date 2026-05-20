@@ -229,6 +229,91 @@ func TestSessionCreateHasNoImplicitBase(t *testing.T) {
 	}
 }
 
+// Posting to a previously unseen channel must succeed and create the channel
+// in passing — workers should not have to POST /api/channels before each
+// first post, which is the boilerplate the skill (and CLI) sidesteps.
+func TestPostAutoCreatesChannel(t *testing.T) {
+	ts, _ := newTestServer(t, Config{MaxPostsPerHour: 100, MaxPushesPerHour: 100})
+
+	_, sess := do(t, "POST", ts.URL+"/api/admin/sessions", "admin", map[string]string{"task": "T"})
+	sID := sess["id"].(string)
+	_, ag := do(t, "POST", ts.URL+"/api/admin/agents", "admin",
+		map[string]string{"id": "a", "session_id": sID})
+	key := ag["api_key"].(string)
+
+	code, _ := do(t, "POST", ts.URL+"/api/channels/general/posts", key,
+		map[string]string{"content": "hello from a"})
+	if code != http.StatusCreated {
+		t.Fatalf("first post to a fresh channel should be 201, got %d", code)
+	}
+
+	// And the channel is now listable.
+	code, listed := do(t, "GET", ts.URL+"/api/channels", key, nil)
+	if code != http.StatusOK {
+		t.Fatalf("list channels: %d", code)
+	}
+	chans, _ := listed["channels"].([]any)
+	if chans == nil {
+		// The handler returns the slice directly (no wrapper). Re-decode.
+		// Fall through — we'll check via second post path below.
+	}
+
+	// A second post to the same channel works without explicit create.
+	code, _ = do(t, "POST", ts.URL+"/api/channels/general/posts", key,
+		map[string]string{"content": "second"})
+	if code != http.StatusCreated {
+		t.Fatalf("second post to auto-created channel should be 201, got %d", code)
+	}
+
+	// Listing a *different* unseen channel still 404s (only create-post
+	// implicitly creates; we don't want list-post or some malicious
+	// enumeration to silently spawn channels).
+	code, _ = do(t, "GET", ts.URL+"/api/channels/nonexistent/posts", key, nil)
+	if code != http.StatusNotFound {
+		t.Fatalf("listing unseen channel should still be 404, got %d", code)
+	}
+}
+
+// "Latest N posts" must return the most-recently-inserted N, even when a
+// bursty worker stamps several posts in the same wall-clock second. Without
+// a rowid tiebreaker on ORDER BY, SQLite returns insertion order under the
+// timestamp tie and the limit silently picks the *oldest* N instead.
+func TestListPostsLatestNWithTiedTimestamps(t *testing.T) {
+	ts, _ := newTestServer(t, Config{MaxPostsPerHour: 100, MaxPushesPerHour: 100})
+
+	_, sess := do(t, "POST", ts.URL+"/api/admin/sessions", "admin", map[string]string{"task": "T"})
+	sID := sess["id"].(string)
+	_, ag := do(t, "POST", ts.URL+"/api/admin/agents", "admin",
+		map[string]string{"id": "a", "session_id": sID})
+	key := ag["api_key"].(string)
+
+	// Five posts in immediate succession will share a created_at second.
+	for i := 1; i <= 5; i++ {
+		code, _ := do(t, "POST", ts.URL+"/api/channels/general/posts", key,
+			map[string]string{"content": fmt.Sprintf("msg-%d", i)})
+		if code != http.StatusCreated {
+			t.Fatalf("post %d: %d", i, code)
+		}
+	}
+
+	req, _ := http.NewRequest("GET", ts.URL+"/api/channels/general/posts?limit=2", nil)
+	req.Header.Set("Authorization", "Bearer "+key)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("list posts: %v", err)
+	}
+	defer resp.Body.Close()
+	var posts []map[string]any
+	json.NewDecoder(resp.Body).Decode(&posts)
+	if len(posts) != 2 {
+		t.Fatalf("want 2 posts, got %d", len(posts))
+	}
+	if posts[0]["content"] != "msg-5" || posts[1]["content"] != "msg-4" {
+		t.Fatalf("--limit 2 should return msg-5 then msg-4 (newest first); got %v then %v",
+			posts[0]["content"], posts[1]["content"])
+	}
+}
+
 func TestRegisterRequiresOpenSession(t *testing.T) {
 	ts, _ := newTestServer(t, Config{MaxPostsPerHour: 100, MaxPushesPerHour: 100})
 

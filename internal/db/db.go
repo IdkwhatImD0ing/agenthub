@@ -404,7 +404,12 @@ func (d *DB) ListCommits(agentID, sessionID string, limit, offset int) ([]Commit
 		q += " AND session_id = ?"
 		args = append(args, sessionID)
 	}
-	q += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+	// rowid DESC tiebreaker: bursty workers can stamp many rows in the same
+	// second, and "give me the latest N" should mean most-recently-inserted
+	// N, not whatever SQLite happens to return for the timestamp tie. rowid
+	// works for both posts (rowid == id) and commits (which has no explicit
+	// id column).
+	q += " ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?"
 	args = append(args, limit, offset)
 	rows, err := d.db.Query(q, args...)
 	if err != nil {
@@ -546,7 +551,12 @@ func (d *DB) ListPosts(channelID int, sessionID string, limit, offset int) ([]Po
 		q += " AND session_id = ?"
 		args = append(args, sessionID)
 	}
-	q += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+	// rowid DESC tiebreaker: bursty workers can stamp many rows in the same
+	// second, and "give me the latest N" should mean most-recently-inserted
+	// N, not whatever SQLite happens to return for the timestamp tie. rowid
+	// works for both posts (rowid == id) and commits (which has no explicit
+	// id column).
+	q += " ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?"
 	args = append(args, limit, offset)
 	rows, err := d.db.Query(q, args...)
 	if err != nil {

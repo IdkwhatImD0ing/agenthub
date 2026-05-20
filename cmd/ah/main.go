@@ -138,12 +138,12 @@ func cmdJoin(args []string) {
 	agentID := fs.String("name", "", "agent name/id")
 	adminKey := fs.String("admin-key", "", "admin key to register agent")
 	sessionID := fs.String("session", "", "session id to bind this agent to")
-	fs.Parse(args)
+	positional := parseFlexible(fs, args)
 
 	// Accept server URL as flag or positional arg
 	serverURL := *serverFlag
-	if serverURL == "" && fs.NArg() > 0 {
-		serverURL = fs.Arg(0)
+	if serverURL == "" && len(positional) > 0 {
+		serverURL = positional[0]
 	}
 	serverURL = strings.TrimRight(serverURL, "/")
 
@@ -424,13 +424,13 @@ func cmdPost(args []string) {
 func cmdRead(args []string) {
 	fs := flag.NewFlagSet("read", flag.ExitOnError)
 	limit := fs.Int("limit", 20, "max posts")
-	fs.Parse(args)
+	positional := parseFlexible(fs, args)
 
-	if fs.NArg() < 1 {
+	if len(positional) < 1 {
 		fmt.Fprintln(os.Stderr, "usage: ah read <channel> [--limit N]")
 		os.Exit(1)
 	}
-	channel := fs.Arg(0)
+	channel := positional[0]
 
 	cfg := mustLoadConfig()
 	client := newClient(cfg)
@@ -632,13 +632,13 @@ func cmdSessionClose(args []string) {
 	status := fs.String("status", "done", "done | failed")
 	commit := fs.String("result", "", "final result commit hash")
 	summary := fs.String("summary", "", "result summary")
-	fs.Parse(args)
+	positional := parseFlexible(fs, args)
 
-	if fs.NArg() < 1 {
+	if len(positional) < 1 {
 		fatal("usage: ah session close <session-id> [--status done|failed] [--result <hash>] [--summary ...]")
 	}
 	client := adminClient(*server, *adminKey)
-	resp, err := client.postJSON("/api/admin/sessions/"+fs.Arg(0)+"/close", map[string]string{
+	resp, err := client.postJSON("/api/admin/sessions/"+positional[0]+"/close", map[string]string{
 		"status":  *status,
 		"commit":  *commit,
 		"summary": *summary,
@@ -658,12 +658,12 @@ func cmdSessionDelete(args []string) {
 	server := fs.String("server", "", "server URL")
 	adminKey := fs.String("admin-key", "", "admin key (omit when targeting a --no-auth server)")
 	yes := fs.Bool("yes", false, "skip confirmation")
-	fs.Parse(args)
+	positional := parseFlexible(fs, args)
 
-	if fs.NArg() < 1 {
+	if len(positional) < 1 {
 		fatal("usage: ah session delete <session-id> [--yes]")
 	}
-	id := fs.Arg(0)
+	id := positional[0]
 	if !*yes {
 		fmt.Fprintf(os.Stderr, "delete session %s and all its agents/commits/posts? [y/N]: ", id)
 		var ans string
@@ -727,6 +727,50 @@ func mustLoadConfig() *CLIConfig {
 		fatal("%v", err)
 	}
 	return cfg
+}
+
+// parseFlexible parses args allowing positionals to appear before, after, or
+// interleaved with flags. The stdlib flag package stops at the first non-flag
+// token, which is a foot-gun for subcommands like `ah session close <id>
+// --status done`. We split args into flag tokens and positionals, hand only
+// the flag tokens to Parse, and expose the positionals back to the caller.
+func parseFlexible(fs *flag.FlagSet, args []string) []string {
+	var positionals, flagArgs []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			// Everything after `--` is positional, per Unix convention.
+			positionals = append(positionals, args[i+1:]...)
+			break
+		}
+		if !strings.HasPrefix(a, "-") {
+			positionals = append(positionals, a)
+			continue
+		}
+		flagArgs = append(flagArgs, a)
+		// `--flag=value` carries its value inline; `--flag value` needs the
+		// next arg too, *unless* the flag is bool.
+		if strings.Contains(a, "=") {
+			continue
+		}
+		name := strings.TrimLeft(a, "-")
+		f := fs.Lookup(name)
+		if f == nil {
+			// Unknown flag — let Parse complain with its own error message.
+			continue
+		}
+		if bf, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && bf.IsBoolFlag() {
+			continue
+		}
+		if i+1 < len(args) {
+			i++
+			flagArgs = append(flagArgs, args[i])
+		}
+	}
+	if err := fs.Parse(flagArgs); err != nil {
+		os.Exit(2)
+	}
+	return positionals
 }
 
 func fatal(format string, args ...any) {

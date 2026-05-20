@@ -110,8 +110,19 @@ func (s *Server) handleCreatePost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if ch == nil {
-		writeError(w, http.StatusNotFound, "channel not found")
-		return
+		// Auto-create on first post. Channels are cheap and swarm-scoped;
+		// asking every worker to POST /api/channels before its first post
+		// is pure boilerplate. Listing a missing channel still 404s — only
+		// the post path implicitly creates.
+		if err := s.db.CreateChannel(name, ""); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to create channel")
+			return
+		}
+		ch, _ = s.db.GetChannelByName(name)
+		if ch == nil {
+			writeError(w, http.StatusInternalServerError, "channel disappeared after create")
+			return
+		}
 	}
 
 	// Rate limit
