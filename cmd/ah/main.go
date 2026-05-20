@@ -24,6 +24,11 @@ type CLIConfig struct {
 }
 
 func configDir() string {
+	// AGENTHUB_CONFIG_DIR lets a swarm spawner give each worker its own
+	// config without having to fake $HOME for every process.
+	if d := os.Getenv("AGENTHUB_CONFIG_DIR"); d != "" {
+		return d
+	}
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".agenthub")
 }
@@ -142,8 +147,9 @@ func cmdJoin(args []string) {
 	}
 	serverURL = strings.TrimRight(serverURL, "/")
 
-	if serverURL == "" || *agentID == "" || *adminKey == "" || *sessionID == "" {
-		fmt.Fprintln(os.Stderr, "usage: ah join --server <url> --name <id> --admin-key <key> --session <session-id>")
+	if serverURL == "" || *agentID == "" || *sessionID == "" {
+		fmt.Fprintln(os.Stderr, "usage: ah join --server <url> --name <id> --session <session-id> [--admin-key <key>]")
+		fmt.Fprintln(os.Stderr, "  --admin-key is required only when the server enforces auth")
 		os.Exit(1)
 	}
 
@@ -546,8 +552,10 @@ func cmdSession(args []string) {
 }
 
 func adminClient(server, adminKey string) *Client {
-	if server == "" || adminKey == "" {
-		fmt.Fprintln(os.Stderr, "--server and --admin-key are required")
+	// --admin-key is optional: a --no-auth server ignores it. If the server
+	// enforces auth and the key is missing/wrong, requests will fail with 401.
+	if server == "" {
+		fmt.Fprintln(os.Stderr, "--server is required")
 		os.Exit(1)
 	}
 	return &Client{
@@ -585,8 +593,11 @@ func cmdSessionCreate(args []string) {
 	} else {
 		fmt.Println("snapshot: (none — no --base given; first push becomes the root)")
 	}
-	fmt.Printf("\nprovision agents with:\n  ah join --server %s --name <id> --admin-key <key> --session %v\n",
-		strings.TrimRight(*server, "/"), sess["id"])
+	hint := fmt.Sprintf("ah join --server %s --name <id> --session %v", strings.TrimRight(*server, "/"), sess["id"])
+	if *adminKey != "" {
+		hint += " --admin-key <key>"
+	}
+	fmt.Printf("\nprovision agents with:\n  %s\n", hint)
 }
 
 func cmdSessionList(args []string) {
@@ -814,14 +825,16 @@ func printUsage() {
 	fmt.Println(`ah — CLI for Agent Hub
 
 Session commands (operator):
-  session create --task "..." --server <url> --admin-key <key>
-  session list --server <url> --admin-key <key>
-  session close <id> [--status done|failed] [--result <hash>] [--summary ...]
+  session create --task "..." --server <url> [--admin-key <k>] [--base <hash>]
+  session list   --server <url> [--admin-key <k>]
+  session close  <id> [--status done|failed] [--result <hash>] [--summary ...]
   session delete <id> [--yes]                 remove session + its agents/commits/posts
   session show                                show this agent's session
 
+  (--admin-key is optional against a --no-auth server.)
+
 Git commands:
-  join <url> --name <id> --admin-key <key> --session <id>   register as agent
+  join --server <url> --name <id> --session <id> [--admin-key <k>]   register as agent
   push                                        push HEAD commit to hub
   fetch <hash>                                fetch a commit from hub
   log [--agent X] [--limit N]                 list recent commits
