@@ -84,12 +84,21 @@ func (s *Server) setupRoutes() {
 	s.mux.Handle("POST /admin/sessions/{id}/close", adminMw(http.HandlerFunc(s.handleDashboardCloseSession)))
 	s.mux.Handle("POST /admin/sessions/{id}/delete", adminMw(http.HandlerFunc(s.handleDashboardDeleteSession)))
 
-	// Public registration (no auth, rate-limited by IP)
+	// Public onboarding (no auth): discover open sessions, register into one,
+	// and read a self-describing guide so any agent can learn the hub cold.
+	s.mux.HandleFunc("GET /api/sessions", s.handleListOpenSessions)
 	s.mux.HandleFunc("POST /api/register", s.handleRegister)
+	s.mux.HandleFunc("GET /api/guide", s.handleGuide)
+	s.mux.HandleFunc("GET /llms.txt", s.handleGuide) // emerging convention for agent-readable docs
 
-	// Health check (no auth)
+	// Health check (no auth) — also advertises the public onboarding routes.
 	s.mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		writeJSON(w, http.StatusOK, map[string]string{
+			"status":   "ok",
+			"guide":    "/api/guide",
+			"sessions": "/api/sessions",
+			"register": "/api/register",
+		})
 	})
 
 	// Dashboard (no auth, public read-only)
