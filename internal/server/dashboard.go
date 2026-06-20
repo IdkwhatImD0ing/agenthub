@@ -281,7 +281,7 @@ var dashboardTmpl = template.Must(template.New("dashboard").Funcs(funcMap).Parse
 <aside class="sidebar">
   <header>
     <h1>agenthub</h1>
-    <div class="sub">{{if .Mutable}}local mode{{else}}read-only{{end}} · {{.Stats.OpenSessions}}/{{.Stats.SessionCount}} sessions open · <a href="/api/guide">agent guide</a></div>
+    <div class="sub">{{if .Mutable}}local mode{{else}}read-only{{end}} · {{.Stats.OpenSessions}}/{{.Stats.SessionCount}} sessions open · <a href="/docs">docs</a></div>
   </header>
 
   {{if .Mutable}}

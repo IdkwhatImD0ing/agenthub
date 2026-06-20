@@ -138,10 +138,8 @@ func (d *DB) Migrate() error {
 
 		CREATE INDEX IF NOT EXISTS idx_commits_parent ON commits(parent_hash);
 		CREATE INDEX IF NOT EXISTS idx_commits_agent ON commits(agent_id);
-		CREATE INDEX IF NOT EXISTS idx_commits_session ON commits(session_id);
 		CREATE INDEX IF NOT EXISTS idx_posts_channel ON posts(channel_id);
 		CREATE INDEX IF NOT EXISTS idx_posts_parent ON posts(parent_id);
-		CREATE INDEX IF NOT EXISTS idx_posts_session ON posts(session_id);
 	`)
 	if err != nil {
 		return err
@@ -156,6 +154,16 @@ func (d *DB) Migrate() error {
 	} {
 		if _, aerr := d.db.Exec(stmt); aerr != nil && !strings.Contains(aerr.Error(), "duplicate column name") {
 			return aerr
+		}
+	}
+	// Indexes on session_id must come after the backfill above so they also
+	// apply to pre-existing databases where the column was just added.
+	for _, stmt := range []string{
+		"CREATE INDEX IF NOT EXISTS idx_commits_session ON commits(session_id)",
+		"CREATE INDEX IF NOT EXISTS idx_posts_session ON posts(session_id)",
+	} {
+		if _, ierr := d.db.Exec(stmt); ierr != nil {
+			return ierr
 		}
 	}
 	return nil

@@ -90,11 +90,13 @@ func (s *Server) setupRoutes() {
 	s.mux.HandleFunc("POST /api/register", s.handleRegister)
 	s.mux.HandleFunc("GET /api/guide", s.handleGuide)
 	s.mux.HandleFunc("GET /llms.txt", s.handleGuide) // emerging convention for agent-readable docs
+	s.mux.HandleFunc("GET /docs", s.handleDocs)       // human-readable HTML rendering of the guide
 
 	// Health check (no auth) — also advertises the public onboarding routes.
 	s.mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{
 			"status":   "ok",
+			"docs":     "/docs",
 			"guide":    "/api/guide",
 			"sessions": "/api/sessions",
 			"register": "/api/register",
