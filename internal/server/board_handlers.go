@@ -12,7 +12,12 @@ import (
 var channelNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,30}$`)
 
 func (s *Server) handleListChannels(w http.ResponseWriter, r *http.Request) {
-	channels, err := s.db.ListChannels()
+	agent := auth.AgentFromContext(r.Context())
+	proj, ok := s.requireProject(w, agent)
+	if !ok {
+		return
+	}
+	channels, err := s.db.ListChannels(proj.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error")
 		return
@@ -28,6 +33,10 @@ func (s *Server) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.requireOpenSession(w, agent); !ok {
 		return
 	}
+	proj, ok := s.requireProject(w, agent)
+	if !ok {
+		return
+	}
 	var req struct {
 		Name        string `json:"name"`
 		Description string `json:"description"`
@@ -41,26 +50,26 @@ func (s *Server) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Cap total channels at 100
-	channels, _ := s.db.ListChannels()
+	// Cap channels at 100 per project.
+	channels, _ := s.db.ListChannels(proj.ID)
 	if len(channels) >= 100 {
 		writeError(w, http.StatusForbidden, "channel limit reached")
 		return
 	}
 
-	// Check if channel already exists
-	existing, _ := s.db.GetChannelByName(req.Name)
+	// Check if channel already exists in this project
+	existing, _ := s.db.GetChannelByName(proj.ID, req.Name)
 	if existing != nil {
 		writeError(w, http.StatusConflict, "channel already exists")
 		return
 	}
 
-	if err := s.db.CreateChannel(req.Name, req.Description); err != nil {
+	if err := s.db.CreateChannel(proj.ID, req.Name, req.Description); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create channel")
 		return
 	}
 
-	ch, _ := s.db.GetChannelByName(req.Name)
+	ch, _ := s.db.GetChannelByName(proj.ID, req.Name)
 	writeJSON(w, http.StatusCreated, ch)
 }
 
@@ -70,8 +79,12 @@ func (s *Server) handleListPosts(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	proj, ok := s.requireProject(w, agent)
+	if !ok {
+		return
+	}
 	name := r.PathValue("name")
-	ch, err := s.db.GetChannelByName(name)
+	ch, err := s.db.GetChannelByName(proj.ID, name)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error")
 		return
@@ -103,22 +116,26 @@ func (s *Server) handleCreatePost(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	proj, ok := s.requireProject(w, agent)
+	if !ok {
+		return
+	}
 
-	ch, err := s.db.GetChannelByName(name)
+	ch, err := s.db.GetChannelByName(proj.ID, name)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error")
 		return
 	}
 	if ch == nil {
-		// Auto-create on first post. Channels are cheap and swarm-scoped;
+		// Auto-create on first post. Channels are cheap and project-scoped;
 		// asking every worker to POST /api/channels before its first post
 		// is pure boilerplate. Listing a missing channel still 404s — only
 		// the post path implicitly creates.
-		if err := s.db.CreateChannel(name, ""); err != nil {
+		if err := s.db.CreateChannel(proj.ID, name, ""); err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to create channel")
 			return
 		}
-		ch, _ = s.db.GetChannelByName(name)
+		ch, _ = s.db.GetChannelByName(proj.ID, name)
 		if ch == nil {
 			writeError(w, http.StatusInternalServerError, "channel disappeared after create")
 			return

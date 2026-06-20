@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"agenthub/internal/db"
-	"agenthub/internal/gitrepo"
 	"agenthub/internal/server"
 )
 
@@ -53,11 +52,8 @@ func main() {
 		log.Fatalf("migrate database: %v", err)
 	}
 
-	// Initialize bare git repo
-	repo, err := gitrepo.Init(filepath.Join(*dataDir, "repo.git"))
-	if err != nil {
-		log.Fatalf("init git repo: %v", err)
-	}
+	// Per-project bare git repos are created lazily under
+	// {dataDir}/projects/{slug}/repo.git, so there's no single repo to init here.
 
 	// Start rate limit cleanup goroutine
 	go func() {
@@ -68,7 +64,7 @@ func main() {
 	}()
 
 	// Start server
-	srv := server.New(database, repo, key, server.Config{
+	srv := server.New(database, *dataDir, key, server.Config{
 		MaxBundleSize:       int64(*maxBundleMB) * 1024 * 1024,
 		MaxPushesPerHour:    *maxPushesPerHour,
 		MaxPostsPerHour:     *maxPostsPerHour,

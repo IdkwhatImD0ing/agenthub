@@ -18,6 +18,15 @@ func (s *Server) handleGitPush(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	proj, ok := s.requireProject(w, agent)
+	if !ok {
+		return
+	}
+	repo, err := s.getProjectRepo(proj.Slug)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to open project repo")
+		return
+	}
 
 	// Rate limit check
 	allowed, err := s.db.CheckRateLimit(agent.ID, "push", s.config.MaxPushesPerHour)
@@ -54,7 +63,7 @@ func (s *Server) handleGitPush(w http.ResponseWriter, r *http.Request) {
 	tmpFile.Close()
 
 	// Unbundle into bare repo
-	hashes, err := s.repo.Unbundle(tmpFile.Name())
+	hashes, err := repo.Unbundle(tmpFile.Name())
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid bundle: "+err.Error())
 		return
@@ -70,14 +79,14 @@ func (s *Server) handleGitPush(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		parentHash, message, err := s.repo.GetCommitInfo(hash)
+		parentHash, message, err := repo.GetCommitInfo(hash)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to read commit info")
 			return
 		}
 
 		// Validate parent exists (unless root commit)
-		if parentHash != "" && !s.repo.CommitExists(parentHash) {
+		if parentHash != "" && !repo.CommitExists(parentHash) {
 			writeError(w, http.StatusBadRequest, "parent commit not found: "+parentHash)
 			return
 		}
@@ -85,7 +94,7 @@ func (s *Server) handleGitPush(w http.ResponseWriter, r *http.Request) {
 		// Also index the parent if it's not in DB yet (e.g. seed repo commits)
 		if parentHash != "" {
 			if pc, _ := s.db.GetCommit(parentHash); pc == nil {
-				pParent, pMsg, _ := s.repo.GetCommitInfo(parentHash)
+				pParent, pMsg, _ := repo.GetCommitInfo(parentHash)
 				s.db.InsertCommit(parentHash, pParent, "", "", pMsg)
 			}
 		}
@@ -107,7 +116,7 @@ func (s *Server) handleGitPush(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGitFetch(w http.ResponseWriter, r *http.Request) {
 	agent := auth.AgentFromContext(r.Context())
-	sessionID, rootCommit, ok := s.sessionScope(w, agent)
+	sessionID, rootCommit, repo, ok := s.sessionRepoScope(w, agent)
 	if !ok {
 		return
 	}
@@ -124,12 +133,12 @@ func (s *Server) handleGitFetch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.repo.CommitExists(hash) {
+	if !repo.CommitExists(hash) {
 		writeError(w, http.StatusNotFound, "commit not found")
 		return
 	}
 
-	bundlePath, err := s.repo.CreateBundle(hash)
+	bundlePath, err := repo.CreateBundle(hash)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to create bundle")
 		return
@@ -251,7 +260,7 @@ func (s *Server) handleGetLeaves(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDiff(w http.ResponseWriter, r *http.Request) {
 	agent := auth.AgentFromContext(r.Context())
-	sessionID, rootCommit, ok := s.sessionScope(w, agent)
+	sessionID, rootCommit, repo, ok := s.sessionRepoScope(w, agent)
 	if !ok {
 		return
 	}
@@ -278,7 +287,7 @@ func (s *Server) handleDiff(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	diff, err := s.repo.Diff(hashA, hashB)
+	diff, err := repo.Diff(hashA, hashB)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "diff failed")
 		return

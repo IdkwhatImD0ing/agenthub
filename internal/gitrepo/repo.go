@@ -73,6 +73,50 @@ func (r *Repo) Unbundle(bundlePath string) ([]string, error) {
 	return hashes, nil
 }
 
+// ImportBundle seeds (or updates) the bare repo from a bundle, mirroring the
+// bundle's branch/tag refs into this repo so the project repo actually tracks
+// the source's branches. Unlike Unbundle (used by per-session pushes, which
+// deliberately create no global branches), this is the operator-level "give
+// this project its canonical repo" path. Returns the imported head hashes.
+func (r *Repo) ImportBundle(bundlePath string) ([]string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	out, err := r.gitOutput("bundle", "list-heads", bundlePath)
+	if err != nil {
+		return nil, fmt.Errorf("bundle list-heads: %w", err)
+	}
+	heads := parseHeads(out)
+	if len(heads) == 0 {
+		return nil, fmt.Errorf("bundle contains no refs")
+	}
+
+	// Unpack objects into the bare repo's object store.
+	if err := r.git("bundle", "unbundle", bundlePath); err != nil {
+		return nil, fmt.Errorf("bundle unbundle: %w", err)
+	}
+
+	// Mirror the source refs so the project repo carries real branches/tags
+	// (and the objects stay anchored against gc). HEAD and any non-"refs/"
+	// pseudo-refs are skipped so we never detach the bare repo's HEAD. The
+	// returned head list is deduped (a bundle's HEAD and refs/heads/<branch>
+	// often point at the same commit).
+	var hashes []string
+	seen := map[string]bool{}
+	for _, h := range heads {
+		if strings.HasPrefix(h.Ref, "refs/") {
+			if err := r.git("update-ref", h.Ref, h.Hash); err != nil {
+				return nil, fmt.Errorf("update-ref %s: %w", h.Ref, err)
+			}
+		}
+		if !seen[h.Hash] {
+			seen[h.Hash] = true
+			hashes = append(hashes, h.Hash)
+		}
+	}
+	return hashes, nil
+}
+
 // CreateBundle creates a temporary bundle file containing the given commit and its ancestors.
 // The caller is responsible for removing the temp file.
 func (r *Repo) CreateBundle(commitHash string) (string, error) {
@@ -213,4 +257,27 @@ func parseHeadHashes(output string) []string {
 		}
 	}
 	return hashes
+}
+
+// bundleHead is a (hash, ref-name) pair from `git bundle list-heads`.
+type bundleHead struct {
+	Hash string
+	Ref  string
+}
+
+// parseHeads extracts (hash, ref) pairs from `git bundle list-heads` output.
+// Lines look like "<hash> refs/heads/<name>" (the ref may be absent).
+func parseHeads(output string) []bundleHead {
+	var heads []bundleHead
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 1 && IsValidHash(fields[0]) {
+			h := bundleHead{Hash: fields[0]}
+			if len(fields) >= 2 {
+				h.Ref = fields[1]
+			}
+			heads = append(heads, h)
+		}
+	}
+	return heads
 }

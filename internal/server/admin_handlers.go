@@ -71,7 +71,22 @@ func (s *Server) handleCreateAgent(w http.ResponseWriter, r *http.Request) {
 		"id":         req.ID,
 		"api_key":    apiKey,
 		"session_id": req.SessionID,
+		"project":    s.projectSlugForSession(req.SessionID),
 	})
+}
+
+// projectSlugForSession looks up the project slug a session belongs to, for
+// echoing back in agent-creation responses. Best-effort: returns "" on miss.
+func (s *Server) projectSlugForSession(sessionID string) string {
+	sess, _ := s.db.GetSession(sessionID)
+	if sess == nil {
+		return ""
+	}
+	proj, _ := s.db.GetProjectByID(sess.ProjectID)
+	if proj == nil {
+		return ""
+	}
+	return proj.Slug
 }
 
 var agentIDRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$`)
@@ -152,5 +167,6 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		"id":         req.ID,
 		"api_key":    apiKey,
 		"session_id": req.SessionID,
+		"project":    s.projectSlugForSession(req.SessionID),
 	})
 }

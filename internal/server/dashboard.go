@@ -7,18 +7,21 @@ import (
 	"time"
 
 	"agenthub/internal/db"
+	"agenthub/internal/gitrepo"
 )
 
 type dashboardData struct {
-	Stats      *db.Stats
-	Sessions   []db.SessionStats
-	Selected   *db.SessionStats     // nil when no ?s= is selected
-	Agents     []db.Agent           // agents in the selected session
-	Commits    []db.Commit          // commits in the selected session
-	Posts      []db.PostWithChannel // posts in the selected session
-	Mutable    bool                 // true when the dashboard may show write actions
-	AutoReload bool                 // refresh meta tag enabled
-	Now        time.Time
+	Stats       *db.Stats
+	Projects    []db.Project
+	CurrProject *db.Project          // nil = all projects (no ?p=)
+	Sessions    []db.SessionStats
+	Selected    *db.SessionStats     // nil when no ?s= is selected
+	Agents      []db.Agent           // agents in the selected session
+	Commits     []db.Commit          // commits in the selected session
+	Posts       []db.PostWithChannel // posts in the selected session
+	Mutable     bool                 // true when the dashboard may show write actions
+	AutoReload  bool                 // refresh meta tag enabled
+	Now         time.Time
 }
 
 func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
@@ -28,15 +31,26 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	}
 
 	stats, _ := s.db.GetStats()
-	sessions, _ := s.db.ListSessionStats()
+	projects, _ := s.db.ListProjects()
 
 	data := dashboardData{
 		Stats:      stats,
-		Sessions:   sessions,
+		Projects:   projects,
 		Mutable:    s.config.NoAuth,
 		AutoReload: true,
 		Now:        time.Now().UTC(),
 	}
+
+	// ?p=<slug> scopes the session list to one project; absent = all projects.
+	projectID := 0
+	if slug := r.URL.Query().Get("p"); slug != "" {
+		if proj, _ := s.db.GetProjectBySlug(slug); proj != nil {
+			data.CurrProject = proj
+			projectID = proj.ID
+		}
+	}
+	sessions, _ := s.db.ListSessionStats(projectID)
+	data.Sessions = sessions
 
 	if id := r.URL.Query().Get("s"); id != "" {
 		for i := range sessions {
@@ -64,7 +78,7 @@ func (s *Server) handleDashboardCreateSession(w http.ResponseWriter, r *http.Req
 		http.Error(w, "invalid form", http.StatusBadRequest)
 		return
 	}
-	sess, status, errMsg := s.createSession(r.FormValue("id"), r.FormValue("task"), r.FormValue("base"))
+	sess, status, errMsg := s.createSession(r.FormValue("id"), r.FormValue("task"), r.FormValue("base"), r.FormValue("project"))
 	if errMsg != "" {
 		http.Error(w, errMsg, status)
 		return
@@ -101,11 +115,20 @@ func (s *Server) handleDashboardCloseSession(w http.ResponseWriter, r *http.Requ
 
 func (s *Server) handleDashboardDeleteSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// Resolve the owning project's repo before the row is deleted.
+	var repo *gitrepo.Repo
+	if sess, _ := s.db.GetSession(id); sess != nil {
+		if proj, _ := s.db.GetProjectByID(sess.ProjectID); proj != nil {
+			repo, _ = s.getProjectRepo(proj.Slug)
+		}
+	}
 	if err := s.db.DeleteSession(id); err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	s.repo.DeleteRef("refs/sessions/" + id)
+	if repo != nil {
+		repo.DeleteRef("refs/sessions/" + id)
+	}
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
 
@@ -187,15 +210,27 @@ var dashboardTmpl = template.Must(template.New("dashboard").Funcs(funcMap).Parse
   }
   .sidebar h1 { font-size: 15px; color: #fff; letter-spacing: 1px; }
   .sidebar .sub { font-size: 11px; color: #555; margin-top: 2px; }
+  .project-switcher {
+    padding: 12px 16px; border-bottom: 1px solid #1a1a1a;
+  }
+  .switcher-label { font-size: 10px; color: #666; text-transform: uppercase;
+    letter-spacing: 1px; margin-bottom: 6px; }
+  .project-list { display: flex; flex-wrap: wrap; gap: 4px; }
+  .project-item {
+    background: #141414; border: 1px solid #222; color: #aaa;
+    padding: 3px 9px; border-radius: 12px; font-size: 11px; cursor: pointer;
+  }
+  .project-item:hover { background: #1a1a1a; border-color: #333; }
+  .project-item.active { background: #1a1a2e; color: #7aa2f7; border-color: #2a3a5a; }
   .new-session {
     padding: 12px 16px; border-bottom: 1px solid #1a1a1a;
     display: flex; flex-direction: column; gap: 6px;
   }
-  .new-session input[type=text] {
+  .new-session input[type=text], .new-session select {
     background: #141414; border: 1px solid #222; color: #e0e0e0;
     padding: 7px 10px; border-radius: 4px; font: inherit; outline: none;
   }
-  .new-session input[type=text]:focus { border-color: #3a3a3a; }
+  .new-session input[type=text]:focus, .new-session select:focus { border-color: #3a3a3a; }
   .new-session button {
     background: #1a2e1a; color: #7af7a2; border: 1px solid #25422a;
     padding: 7px; border-radius: 4px; cursor: pointer;
@@ -284,10 +319,23 @@ var dashboardTmpl = template.Must(template.New("dashboard").Funcs(funcMap).Parse
     <div class="sub">{{if .Mutable}}local mode{{else}}read-only{{end}} · {{.Stats.OpenSessions}}/{{.Stats.SessionCount}} sessions open · <a href="/api/guide">agent guide</a></div>
   </header>
 
+  <div class="project-switcher">
+    <div class="switcher-label">Project</div>
+    <div class="project-list">
+      <a class="project-item{{if not .CurrProject}} active{{end}}" href="/">all</a>
+      {{range .Projects}}
+      <a class="project-item{{if and $.CurrProject (eq .Slug $.CurrProject.Slug)}} active{{end}}" href="/?p={{.Slug}}">{{.Slug}}</a>
+      {{end}}
+    </div>
+  </div>
+
   {{if .Mutable}}
   <form class="new-session" method="post" action="/admin/sessions/create">
     <input type="text" name="task" placeholder="task for the swarm…" required>
     <input type="text" name="base" placeholder="base commit (optional)">
+    <select name="project">
+      {{range .Projects}}<option value="{{.Slug}}"{{if $.CurrProject}}{{if eq .Slug $.CurrProject.Slug}} selected{{end}}{{else if eq .Slug "default"}} selected{{end}}>{{.Slug}}</option>{{end}}
+    </select>
     <button type="submit">+ new session</button>
   </form>
   {{end}}

@@ -11,8 +11,17 @@ import (
 
 // Model structs
 
+type Project struct {
+	ID          int       `json:"id"`
+	Slug        string    `json:"slug"`
+	Name        string    `json:"name"`
+	Description string    `json:"description"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
 type Session struct {
 	ID         string     `json:"id"`
+	ProjectID  int        `json:"project_id"`
 	Task       string     `json:"task"`
 	Status     string     `json:"status"` // open | done | failed
 	RootCommit string     `json:"root_commit,omitempty"`
@@ -83,10 +92,24 @@ func (d *DB) Close() error {
 	return d.db.Close()
 }
 
+// DefaultProjectSlug is the project every session lands in when none is
+// specified. It is bootstrapped on migrate so the hub is usable out of the box
+// and pre-project rows have a home.
+const DefaultProjectSlug = "default"
+
 func (d *DB) Migrate() error {
 	_, err := d.db.Exec(`
+		CREATE TABLE IF NOT EXISTS projects (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			slug TEXT UNIQUE NOT NULL,
+			name TEXT NOT NULL DEFAULT '',
+			description TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);
+
 		CREATE TABLE IF NOT EXISTS sessions (
 			id TEXT PRIMARY KEY,
+			project_id INTEGER REFERENCES projects(id),
 			task TEXT NOT NULL DEFAULT '',
 			status TEXT NOT NULL DEFAULT 'open',
 			root_commit TEXT NOT NULL DEFAULT '',
@@ -113,7 +136,8 @@ func (d *DB) Migrate() error {
 
 		CREATE TABLE IF NOT EXISTS channels (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			name TEXT UNIQUE NOT NULL,
+			project_id INTEGER REFERENCES projects(id),
+			name TEXT NOT NULL,
 			description TEXT DEFAULT '',
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);
@@ -153,30 +177,118 @@ func (d *DB) Migrate() error {
 		"ALTER TABLE commits ADD COLUMN session_id TEXT",
 		"ALTER TABLE posts ADD COLUMN session_id TEXT",
 		"ALTER TABLE sessions ADD COLUMN root_commit TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE sessions ADD COLUMN project_id INTEGER REFERENCES projects(id)",
+		"ALTER TABLE channels ADD COLUMN project_id INTEGER REFERENCES projects(id)",
 	} {
 		if _, aerr := d.db.Exec(stmt); aerr != nil && !strings.Contains(aerr.Error(), "duplicate column name") {
 			return aerr
 		}
 	}
+
+	// Bootstrap the default project so every session/channel has a home.
+	if _, err := d.db.Exec(
+		"INSERT OR IGNORE INTO projects (slug, name, description) VALUES (?, ?, ?)",
+		DefaultProjectSlug, "Default", "Default project",
+	); err != nil {
+		return err
+	}
+	var defaultID int
+	if err := d.db.QueryRow("SELECT id FROM projects WHERE slug = ?", DefaultProjectSlug).Scan(&defaultID); err != nil {
+		return err
+	}
+	// Adopt any pre-project rows into the default project.
+	if _, err := d.db.Exec("UPDATE sessions SET project_id = ? WHERE project_id IS NULL", defaultID); err != nil {
+		return err
+	}
+	if _, err := d.db.Exec("UPDATE channels SET project_id = ? WHERE project_id IS NULL", defaultID); err != nil {
+		return err
+	}
+
+	// Channel names are unique per project (not globally). The unique index is
+	// created after the backfill so existing rows carry a project_id first.
+	if _, err := d.db.Exec(
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_project_name ON channels(project_id, name)",
+	); err != nil {
+		return err
+	}
+	if _, err := d.db.Exec(
+		"CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_id)",
+	); err != nil {
+		return err
+	}
 	return nil
+}
+
+// --- Projects ---
+
+func (d *DB) CreateProject(slug, name, description string) error {
+	_, err := d.db.Exec(
+		"INSERT INTO projects (slug, name, description) VALUES (?, ?, ?)",
+		slug, name, description,
+	)
+	return err
+}
+
+func (d *DB) GetProjectBySlug(slug string) (*Project, error) {
+	var p Project
+	err := d.db.QueryRow(
+		"SELECT id, slug, name, description, created_at FROM projects WHERE slug = ?", slug,
+	).Scan(&p.ID, &p.Slug, &p.Name, &p.Description, &p.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &p, err
+}
+
+func (d *DB) GetProjectByID(id int) (*Project, error) {
+	var p Project
+	err := d.db.QueryRow(
+		"SELECT id, slug, name, description, created_at FROM projects WHERE id = ?", id,
+	).Scan(&p.ID, &p.Slug, &p.Name, &p.Description, &p.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	return &p, err
+}
+
+func (d *DB) ListProjects() ([]Project, error) {
+	rows, err := d.db.Query("SELECT id, slug, name, description, created_at FROM projects ORDER BY slug")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var projects []Project
+	for rows.Next() {
+		var p Project
+		if err := rows.Scan(&p.ID, &p.Slug, &p.Name, &p.Description, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		projects = append(projects, p)
+	}
+	return projects, rows.Err()
 }
 
 // --- Sessions ---
 
-func (d *DB) CreateSession(id, task, rootCommit string) error {
-	_, err := d.db.Exec("INSERT INTO sessions (id, task, root_commit) VALUES (?, ?, ?)", id, task, rootCommit)
+func (d *DB) CreateSession(id, task, rootCommit string, projectID int) error {
+	_, err := d.db.Exec(
+		"INSERT INTO sessions (id, project_id, task, root_commit) VALUES (?, ?, ?, ?)",
+		id, projectID, task, rootCommit,
+	)
 	return err
 }
 
 func (d *DB) GetSession(id string) (*Session, error) {
 	var s Session
 	var closedAt sql.NullTime
+	var projectID sql.NullInt64
 	err := d.db.QueryRow(
-		"SELECT id, task, status, root_commit, result, created_at, closed_at FROM sessions WHERE id = ?", id,
-	).Scan(&s.ID, &s.Task, &s.Status, &s.RootCommit, &s.Result, &s.CreatedAt, &closedAt)
+		"SELECT id, project_id, task, status, root_commit, result, created_at, closed_at FROM sessions WHERE id = ?", id,
+	).Scan(&s.ID, &projectID, &s.Task, &s.Status, &s.RootCommit, &s.Result, &s.CreatedAt, &closedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
+	s.ProjectID = int(projectID.Int64)
 	if closedAt.Valid {
 		s.ClosedAt = &closedAt.Time
 	}
@@ -184,7 +296,7 @@ func (d *DB) GetSession(id string) (*Session, error) {
 }
 
 func (d *DB) ListSessions() ([]Session, error) {
-	rows, err := d.db.Query("SELECT id, task, status, root_commit, result, created_at, closed_at FROM sessions ORDER BY created_at DESC")
+	rows, err := d.db.Query("SELECT id, project_id, task, status, root_commit, result, created_at, closed_at FROM sessions ORDER BY created_at DESC")
 	if err != nil {
 		return nil, err
 	}
@@ -193,9 +305,11 @@ func (d *DB) ListSessions() ([]Session, error) {
 	for rows.Next() {
 		var s Session
 		var closedAt sql.NullTime
-		if err := rows.Scan(&s.ID, &s.Task, &s.Status, &s.RootCommit, &s.Result, &s.CreatedAt, &closedAt); err != nil {
+		var projectID sql.NullInt64
+		if err := rows.Scan(&s.ID, &projectID, &s.Task, &s.Status, &s.RootCommit, &s.Result, &s.CreatedAt, &closedAt); err != nil {
 			return nil, err
 		}
+		s.ProjectID = int(projectID.Int64)
 		if closedAt.Valid {
 			s.ClosedAt = &closedAt.Time
 		}
@@ -494,13 +608,19 @@ func scanCommits(rows *sql.Rows) ([]Commit, error) {
 
 // --- Channels ---
 
-func (d *DB) CreateChannel(name, description string) error {
-	_, err := d.db.Exec("INSERT INTO channels (name, description) VALUES (?, ?)", name, description)
+func (d *DB) CreateChannel(projectID int, name, description string) error {
+	_, err := d.db.Exec(
+		"INSERT INTO channels (project_id, name, description) VALUES (?, ?, ?)",
+		projectID, name, description,
+	)
 	return err
 }
 
-func (d *DB) ListChannels() ([]Channel, error) {
-	rows, err := d.db.Query("SELECT id, name, description, created_at FROM channels ORDER BY name")
+func (d *DB) ListChannels(projectID int) ([]Channel, error) {
+	rows, err := d.db.Query(
+		"SELECT id, name, description, created_at FROM channels WHERE project_id = ? ORDER BY name",
+		projectID,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -516,10 +636,12 @@ func (d *DB) ListChannels() ([]Channel, error) {
 	return channels, rows.Err()
 }
 
-func (d *DB) GetChannelByName(name string) (*Channel, error) {
+func (d *DB) GetChannelByName(projectID int, name string) (*Channel, error) {
 	var ch Channel
-	err := d.db.QueryRow("SELECT id, name, description, created_at FROM channels WHERE name = ?", name).
-		Scan(&ch.ID, &ch.Name, &ch.Description, &ch.CreatedAt)
+	err := d.db.QueryRow(
+		"SELECT id, name, description, created_at FROM channels WHERE project_id = ? AND name = ?",
+		projectID, name,
+	).Scan(&ch.ID, &ch.Name, &ch.Description, &ch.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -643,14 +765,22 @@ type SessionStats struct {
 	PostCount   int
 }
 
-func (d *DB) ListSessionStats() ([]SessionStats, error) {
-	rows, err := d.db.Query(`
-		SELECT s.id, s.task, s.status, s.root_commit, s.result, s.created_at, s.closed_at,
+// ListSessionStats returns per-session activity counts. projectID 0 means all
+// projects (operator/global view); a positive id scopes to one project.
+func (d *DB) ListSessionStats(projectID int) ([]SessionStats, error) {
+	q := `
+		SELECT s.id, s.project_id, s.task, s.status, s.root_commit, s.result, s.created_at, s.closed_at,
 			(SELECT COUNT(*) FROM agents  a WHERE a.session_id = s.id),
 			(SELECT COUNT(*) FROM commits c WHERE c.session_id = s.id),
 			(SELECT COUNT(*) FROM posts   p WHERE p.session_id = s.id)
-		FROM sessions s
-		ORDER BY s.created_at DESC`)
+		FROM sessions s`
+	var args []any
+	if projectID > 0 {
+		q += " WHERE s.project_id = ?"
+		args = append(args, projectID)
+	}
+	q += " ORDER BY s.created_at DESC"
+	rows, err := d.db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -659,10 +789,12 @@ func (d *DB) ListSessionStats() ([]SessionStats, error) {
 	for rows.Next() {
 		var ss SessionStats
 		var closedAt sql.NullTime
-		if err := rows.Scan(&ss.ID, &ss.Task, &ss.Status, &ss.RootCommit, &ss.Result,
+		var projID sql.NullInt64
+		if err := rows.Scan(&ss.ID, &projID, &ss.Task, &ss.Status, &ss.RootCommit, &ss.Result,
 			&ss.CreatedAt, &closedAt, &ss.AgentCount, &ss.CommitCount, &ss.PostCount); err != nil {
 			return nil, err
 		}
+		ss.ProjectID = int(projID.Int64)
 		if closedAt.Valid {
 			ss.ClosedAt = &closedAt.Time
 		}
