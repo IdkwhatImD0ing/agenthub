@@ -5,6 +5,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"path/filepath"
+	"sync"
 
 	"agenthub/internal/auth"
 	"agenthub/internal/db"
@@ -22,22 +24,49 @@ type Config struct {
 
 type Server struct {
 	db       *db.DB
-	repo     *gitrepo.Repo
+	dataDir  string                   // base data dir; per-project repos live under {dataDir}/projects/{slug}/repo.git
+	repos    map[string]*gitrepo.Repo // slug -> bare repo, lazily initialized
+	reposMu  sync.RWMutex
 	adminKey string
 	mux      *http.ServeMux
 	config   Config
 }
 
-func New(database *db.DB, repo *gitrepo.Repo, adminKey string, cfg Config) *Server {
+func New(database *db.DB, dataDir, adminKey string, cfg Config) *Server {
 	s := &Server{
 		db:       database,
-		repo:     repo,
+		dataDir:  dataDir,
+		repos:    make(map[string]*gitrepo.Repo),
 		adminKey: adminKey,
 		mux:      http.NewServeMux(),
 		config:   cfg,
 	}
 	s.setupRoutes()
 	return s
+}
+
+// getProjectRepo returns the bare git repo for a project, lazily creating it on
+// disk under {dataDir}/projects/{slug}/repo.git and caching the handle.
+func (s *Server) getProjectRepo(slug string) (*gitrepo.Repo, error) {
+	s.reposMu.RLock()
+	repo := s.repos[slug]
+	s.reposMu.RUnlock()
+	if repo != nil {
+		return repo, nil
+	}
+
+	s.reposMu.Lock()
+	defer s.reposMu.Unlock()
+	// Re-check under the write lock in case another goroutine won the race.
+	if repo := s.repos[slug]; repo != nil {
+		return repo, nil
+	}
+	repo, err := gitrepo.Init(filepath.Join(s.dataDir, "projects", slug, "repo.git"))
+	if err != nil {
+		return nil, err
+	}
+	s.repos[slug] = repo
+	return repo, nil
 }
 
 func (s *Server) setupRoutes() {
@@ -71,8 +100,17 @@ func (s *Server) setupRoutes() {
 	s.mux.Handle("GET /api/session", authMw(http.HandlerFunc(s.handleGetCurrentSession)))
 	s.mux.Handle("GET /api/sessions/{id}", authMw(http.HandlerFunc(s.handleGetSession)))
 
+	// Project endpoints. The agent's project is derived from its session, so
+	// /api/project (singular) returns the caller's project; /api/projects is
+	// public discovery (mirrors /api/sessions).
+	s.mux.Handle("GET /api/project", authMw(http.HandlerFunc(s.handleGetCurrentProject)))
+	s.mux.HandleFunc("GET /api/projects", s.handleListProjects)
+
 	// Admin endpoints
 	s.mux.Handle("POST /api/admin/agents", adminMw(http.HandlerFunc(s.handleCreateAgent)))
+	s.mux.Handle("POST /api/admin/projects", adminMw(http.HandlerFunc(s.handleCreateProject)))
+	s.mux.Handle("GET /api/admin/projects", adminMw(http.HandlerFunc(s.handleAdminListProjects)))
+	s.mux.Handle("POST /api/admin/projects/{slug}/import", adminMw(http.HandlerFunc(s.handleImportProject)))
 	s.mux.Handle("POST /api/admin/sessions", adminMw(http.HandlerFunc(s.handleCreateSession)))
 	s.mux.Handle("GET /api/admin/sessions", adminMw(http.HandlerFunc(s.handleListSessions)))
 	s.mux.Handle("POST /api/admin/sessions/{id}/close", adminMw(http.HandlerFunc(s.handleCloseSession)))
@@ -169,6 +207,54 @@ func (s *Server) sessionScope(w http.ResponseWriter, agent *db.Agent) (sessionID
 		rootCommit = sess.RootCommit
 	}
 	return sessionID, rootCommit, true
+}
+
+// agentProject resolves the project an agent belongs to, via its session. An
+// agent not bound to a session (or whose session/project vanished) yields nil.
+func (s *Server) agentProject(agent *db.Agent) (*db.Project, error) {
+	if agent == nil || agent.SessionID == "" {
+		return nil, nil
+	}
+	sess, err := s.db.GetSession(agent.SessionID)
+	if err != nil || sess == nil {
+		return nil, err
+	}
+	return s.db.GetProjectByID(sess.ProjectID)
+}
+
+// requireProject resolves the caller's project (board scope) and rejects the
+// request if the agent is not bound to a usable project.
+func (s *Server) requireProject(w http.ResponseWriter, agent *db.Agent) (*db.Project, bool) {
+	proj, err := s.agentProject(agent)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "database error")
+		return nil, false
+	}
+	if proj == nil {
+		writeError(w, http.StatusForbidden, "agent is not bound to a project")
+		return nil, false
+	}
+	return proj, true
+}
+
+// sessionRepoScope resolves session scope plus the per-project bare repo for
+// git handlers that need both. The repo is the one owned by the agent's
+// project.
+func (s *Server) sessionRepoScope(w http.ResponseWriter, agent *db.Agent) (sessionID, rootCommit string, repo *gitrepo.Repo, ok bool) {
+	sessionID, rootCommit, ok = s.sessionScope(w, agent)
+	if !ok {
+		return "", "", nil, false
+	}
+	proj, ok2 := s.requireProject(w, agent)
+	if !ok2 {
+		return "", "", nil, false
+	}
+	repo, err := s.getProjectRepo(proj.Slug)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to open project repo")
+		return "", "", nil, false
+	}
+	return sessionID, rootCommit, repo, true
 }
 
 func decodeJSON(r *http.Request, v any) error {

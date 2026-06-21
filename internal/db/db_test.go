@@ -18,10 +18,21 @@ func newTestDB(t *testing.T) *DB {
 	return d
 }
 
+// defaultProjectID returns the id of the bootstrapped default project, which
+// Migrate creates and into which sessions/channels land when unscoped.
+func defaultProjectID(t *testing.T, d *DB) int {
+	t.Helper()
+	p, err := d.GetProjectBySlug(DefaultProjectSlug)
+	if err != nil || p == nil {
+		t.Fatalf("default project missing: %v", err)
+	}
+	return p.ID
+}
+
 func TestSessionLifecycle(t *testing.T) {
 	d := newTestDB(t)
 
-	if err := d.CreateSession("s1", "do the thing", ""); err != nil {
+	if err := d.CreateSession("s1", "do the thing", "", defaultProjectID(t, d)); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	s, err := d.GetSession("s1")
@@ -156,10 +167,11 @@ func TestPostsSessionIsolation(t *testing.T) {
 	d := newTestDB(t)
 	mustSession(t, d, "A")
 	mustSession(t, d, "B")
-	if err := d.CreateChannel("general", ""); err != nil {
+	pid := defaultProjectID(t, d)
+	if err := d.CreateChannel(pid, "general", ""); err != nil {
 		t.Fatalf("channel: %v", err)
 	}
-	ch, _ := d.GetChannelByName("general")
+	ch, _ := d.GetChannelByName(pid, "general")
 	if err := d.CreateAgent("alice", "ka", "A"); err != nil {
 		t.Fatalf("agent alice: %v", err)
 	}
@@ -192,7 +204,7 @@ func TestPostsSessionIsolation(t *testing.T) {
 
 func mustSession(t *testing.T, d *DB, id string) {
 	t.Helper()
-	if err := d.CreateSession(id, "task "+id, ""); err != nil {
+	if err := d.CreateSession(id, "task "+id, "", defaultProjectID(t, d)); err != nil {
 		t.Fatalf("create session %s: %v", id, err)
 	}
 }

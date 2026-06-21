@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	"agenthub/internal/db"
-	"agenthub/internal/gitrepo"
 )
 
 func newTestServer(t *testing.T, cfg Config) (*httptest.Server, *db.DB) {
@@ -24,11 +23,7 @@ func newTestServer(t *testing.T, cfg Config) (*httptest.Server, *db.DB) {
 	if err := database.Migrate(); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	repo, err := gitrepo.Init(filepath.Join(dir, "repo.git"))
-	if err != nil {
-		t.Fatalf("init repo: %v", err)
-	}
-	srv := New(database, repo, "admin", cfg)
+	srv := New(database, dir, "admin", cfg)
 	ts := httptest.NewServer(srv.mux)
 	t.Cleanup(func() { ts.Close(); database.Close() })
 	return ts, database
@@ -311,6 +306,69 @@ func TestListPostsLatestNWithTiedTimestamps(t *testing.T) {
 	if posts[0]["content"] != "msg-5" || posts[1]["content"] != "msg-4" {
 		t.Fatalf("--limit 2 should return msg-5 then msg-4 (newest first); got %v then %v",
 			posts[0]["content"], posts[1]["content"])
+	}
+}
+
+// Channels live in a project namespace: two sessions in different projects
+// must not see each other's channels, and identical channel names can coexist
+// across projects without colliding.
+func TestChannelsIsolatedAcrossProjects(t *testing.T) {
+	ts, _ := newTestServer(t, Config{MaxPostsPerHour: 100, MaxPushesPerHour: 100})
+
+	// Create a second project alongside the bootstrapped "default".
+	if code, body := do(t, "POST", ts.URL+"/api/admin/projects", "admin",
+		map[string]string{"slug": "beta", "name": "Beta"}); code != http.StatusCreated {
+		t.Fatalf("create project beta: %d %v", code, body)
+	}
+
+	// Session A in the default project.
+	_, sA := do(t, "POST", ts.URL+"/api/admin/sessions", "admin", map[string]string{"task": "A"})
+	_, agA := do(t, "POST", ts.URL+"/api/admin/agents", "admin",
+		map[string]string{"id": "a", "session_id": sA["id"].(string)})
+	keyA := agA["api_key"].(string)
+
+	// Session B in the beta project.
+	_, sB := do(t, "POST", ts.URL+"/api/admin/sessions", "admin",
+		map[string]string{"task": "B", "project": "beta"})
+	_, agB := do(t, "POST", ts.URL+"/api/admin/agents", "admin",
+		map[string]string{"id": "b", "session_id": sB["id"].(string)})
+	keyB := agB["api_key"].(string)
+
+	// Each agent reports the right project.
+	if _, p := do(t, "GET", ts.URL+"/api/project", keyA, nil); p["slug"] != db.DefaultProjectSlug {
+		t.Fatalf("agent A project should be %q, got %v", db.DefaultProjectSlug, p["slug"])
+	}
+	if _, p := do(t, "GET", ts.URL+"/api/project", keyB, nil); p["slug"] != "beta" {
+		t.Fatalf("agent B project should be beta, got %v", p["slug"])
+	}
+
+	// A creates a channel named "general" in the default project.
+	if code, _ := do(t, "POST", ts.URL+"/api/channels", keyA, map[string]string{"name": "general"}); code != http.StatusCreated {
+		t.Fatalf("A create channel general: %d", code)
+	}
+	// B can create its own "general" in beta without a conflict.
+	if code, body := do(t, "POST", ts.URL+"/api/channels", keyB, map[string]string{"name": "general"}); code != http.StatusCreated {
+		t.Fatalf("B create channel general in beta should succeed (per-project namespace), got %d %v", code, body)
+	}
+
+	// A's channel listing must not leak beta's channels and vice versa.
+	listChannels := func(key string) []any {
+		req, _ := http.NewRequest("GET", ts.URL+"/api/channels", nil)
+		req.Header.Set("Authorization", "Bearer "+key)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("list channels: %v", err)
+		}
+		defer resp.Body.Close()
+		var chans []any
+		json.NewDecoder(resp.Body).Decode(&chans)
+		return chans
+	}
+	if got := len(listChannels(keyA)); got != 1 {
+		t.Fatalf("default project should list exactly 1 channel, got %d", got)
+	}
+	if got := len(listChannels(keyB)); got != 1 {
+		t.Fatalf("beta project should list exactly 1 channel, got %d", got)
 	}
 }
 

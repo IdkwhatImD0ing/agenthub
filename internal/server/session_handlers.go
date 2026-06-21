@@ -8,16 +8,32 @@ import (
 
 	"agenthub/internal/auth"
 	"agenthub/internal/db"
+	"agenthub/internal/gitrepo"
 )
 
 var sessionIDRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$`)
 
 // createSession performs the shared open-session work used by the JSON API and
-// the dashboard form. Returns the new session, the HTTP status to use, and a
-// human error message (empty when ok).
-func (s *Server) createSession(id, task, base string) (*db.Session, int, string) {
+// the dashboard form. The session is created inside the given project (slug;
+// empty means the default project). Returns the new session, the HTTP status to
+// use, and a human error message (empty when ok).
+func (s *Server) createSession(id, task, base, projectSlug string) (*db.Session, int, string) {
 	if task == "" {
 		return nil, http.StatusBadRequest, "task is required"
+	}
+	if projectSlug == "" {
+		projectSlug = db.DefaultProjectSlug
+	}
+	proj, err := s.db.GetProjectBySlug(projectSlug)
+	if err != nil {
+		return nil, http.StatusInternalServerError, "database error"
+	}
+	if proj == nil {
+		return nil, http.StatusBadRequest, "project not found: " + projectSlug
+	}
+	repo, err := s.getProjectRepo(proj.Slug)
+	if err != nil {
+		return nil, http.StatusInternalServerError, "failed to open project repo"
 	}
 	if id == "" {
 		b := make([]byte, 8)
@@ -36,24 +52,25 @@ func (s *Server) createSession(id, task, base string) (*db.Session, int, string)
 	// The snapshot baseline must be explicit. There is no global "current
 	// repo" (the DAG has many tips across sessions), so defaulting would
 	// silently pin an unrelated session's work. Without --base the session
-	// starts empty and its first push becomes the root.
+	// starts empty and its first push becomes the root. The base is resolved
+	// against the project's own repo.
 	if base != "" {
-		if !s.repo.CommitExists(base) {
-			return nil, http.StatusBadRequest, "base commit not found in hub"
+		if !repo.CommitExists(base) {
+			return nil, http.StatusBadRequest, "base commit not found in project"
 		}
 		if c, _ := s.db.GetCommit(base); c == nil {
-			pHash, pMsg, _ := s.repo.GetCommitInfo(base)
+			pHash, pMsg, _ := repo.GetCommitInfo(base)
 			if err := s.db.InsertCommit(base, pHash, "", "", pMsg); err != nil {
 				return nil, http.StatusInternalServerError, "failed to index snapshot"
 			}
 		}
 		// Freeze the snapshot ref *before* persisting the session so a
 		// session row never exists without its frozen baseline.
-		if err := s.repo.CreateRef("refs/sessions/"+id, base); err != nil {
+		if err := repo.CreateRef("refs/sessions/"+id, base); err != nil {
 			return nil, http.StatusInternalServerError, "failed to freeze snapshot: " + err.Error()
 		}
 	}
-	if err := s.db.CreateSession(id, task, base); err != nil {
+	if err := s.db.CreateSession(id, task, base, proj.ID); err != nil {
 		return nil, http.StatusInternalServerError, "failed to create session"
 	}
 	sess, _ := s.db.GetSession(id)
@@ -64,15 +81,16 @@ func (s *Server) createSession(id, task, base string) (*db.Session, int, string)
 // session lifecycle; agents are later bound to the returned id.
 func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		ID   string `json:"id"`
-		Task string `json:"task"`
-		Base string `json:"base"`
+		ID      string `json:"id"`
+		Task    string `json:"task"`
+		Base    string `json:"base"`
+		Project string `json:"project"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
-	sess, status, errMsg := s.createSession(req.ID, req.Task, req.Base)
+	sess, status, errMsg := s.createSession(req.ID, req.Task, req.Base, req.Project)
 	if errMsg != "" {
 		writeError(w, status, errMsg)
 		return
@@ -80,9 +98,23 @@ func (s *Server) handleCreateSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, status, sess)
 }
 
-// handleListSessions (admin) lists all sessions with activity counts.
+// handleListSessions (admin) lists sessions with activity counts. An optional
+// ?project=<slug> filter scopes the listing to one project.
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
-	sessions, err := s.db.ListSessionStats()
+	projectID := 0
+	if slug := r.URL.Query().Get("project"); slug != "" {
+		proj, err := s.db.GetProjectBySlug(slug)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "database error")
+			return
+		}
+		if proj == nil {
+			writeError(w, http.StatusBadRequest, "project not found: "+slug)
+			return
+		}
+		projectID = proj.ID
+	}
+	sessions, err := s.db.ListSessionStats(projectID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "database error")
 		return
@@ -152,6 +184,14 @@ func (s *Server) handleGetCurrentSession(w http.ResponseWriter, r *http.Request)
 // agents, rate-limit counters, and the frozen snapshot ref.
 func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	// Resolve the owning project's repo *before* deleting the row, so we can
+	// clean up the snapshot ref afterwards.
+	var repo *gitrepo.Repo
+	if sess, _ := s.db.GetSession(id); sess != nil {
+		if proj, _ := s.db.GetProjectByID(sess.ProjectID); proj != nil {
+			repo, _ = s.getProjectRepo(proj.Slug)
+		}
+	}
 	if err := s.db.DeleteSession(id); err != nil {
 		if err.Error() == "session not found" {
 			writeError(w, http.StatusNotFound, err.Error())
@@ -162,7 +202,9 @@ func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	}
 	// Best-effort: remove the snapshot ref. The DB row is already gone, so
 	// failure here just leaves a dangling ref in the bare repo.
-	s.repo.DeleteRef("refs/sessions/" + id)
+	if repo != nil {
+		repo.DeleteRef("refs/sessions/" + id)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 

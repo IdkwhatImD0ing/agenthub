@@ -21,6 +21,7 @@ type CLIConfig struct {
 	APIKey    string `json:"api_key"`
 	AgentID   string `json:"agent_id"`
 	SessionID string `json:"session_id"`
+	Project   string `json:"project"`
 }
 
 func configDir() string {
@@ -177,12 +178,17 @@ func cmdJoin(args []string) {
 		APIKey:    apiKey,
 		AgentID:   *agentID,
 		SessionID: *sessionID,
+		Project:   result["project"],
 	}
 	if err := saveConfig(cfg); err != nil {
 		fatal("failed to save config: %v", err)
 	}
 
-	fmt.Printf("joined %s as %q (session %s)\n", serverURL, *agentID, *sessionID)
+	if cfg.Project != "" {
+		fmt.Printf("joined %s as %q (project %s, session %s)\n", serverURL, *agentID, cfg.Project, *sessionID)
+	} else {
+		fmt.Printf("joined %s as %q (session %s)\n", serverURL, *agentID, *sessionID)
+	}
 	fmt.Printf("api key: %s\n", apiKey)
 	fmt.Printf("config saved to %s\n", configPath())
 }
@@ -572,13 +578,16 @@ func cmdSessionCreate(args []string) {
 	task := fs.String("task", "", "task description for the swarm")
 	id := fs.String("id", "", "optional explicit session id")
 	base := fs.String("base", "", "commit hash to snapshot (optional; omitted = session starts empty)")
+	project := fs.String("project", "", "project slug to create the session in (default: default)")
 	fs.Parse(args)
 
 	if *task == "" {
 		fatal("--task is required")
 	}
 	client := adminClient(*server, *adminKey)
-	resp, err := client.postJSON("/api/admin/sessions", map[string]string{"id": *id, "task": *task, "base": *base})
+	resp, err := client.postJSON("/api/admin/sessions", map[string]string{
+		"id": *id, "task": *task, "base": *base, "project": *project,
+	})
 	if err != nil {
 		fatal("create failed: %v", err)
 	}
@@ -604,10 +613,15 @@ func cmdSessionList(args []string) {
 	fs := flag.NewFlagSet("session list", flag.ExitOnError)
 	server := fs.String("server", "", "server URL")
 	adminKey := fs.String("admin-key", "", "admin key")
+	project := fs.String("project", "", "filter by project slug")
 	fs.Parse(args)
 
 	client := adminClient(*server, *adminKey)
-	resp, err := client.get("/api/admin/sessions")
+	path := "/api/admin/sessions"
+	if *project != "" {
+		path += "?project=" + *project
+	}
+	resp, err := client.get(path)
 	if err != nil {
 		fatal("request failed: %v", err)
 	}
@@ -716,6 +730,159 @@ func cmdSessionShow(args []string) {
 	}
 	if r := str(sess["result"]); r != "" {
 		fmt.Printf("result:   %s\n", r)
+	}
+}
+
+// Project commands (operator-owned; the top-level grouping above sessions)
+
+func cmdProject(args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: ah project <create|show> ...")
+		os.Exit(1)
+	}
+	switch args[0] {
+	case "create":
+		cmdProjectCreate(args[1:])
+	case "import":
+		cmdProjectImport(args[1:])
+	case "show":
+		cmdProjectShow(args[1:])
+	default:
+		fmt.Fprintf(os.Stderr, "unknown project subcommand: %s\n", args[0])
+		os.Exit(1)
+	}
+}
+
+func cmdProjectCreate(args []string) {
+	fs := flag.NewFlagSet("project create", flag.ExitOnError)
+	server := fs.String("server", "", "server URL")
+	adminKey := fs.String("admin-key", "", "admin key")
+	slug := fs.String("slug", "", "project slug (lowercase, url/dir safe)")
+	name := fs.String("name", "", "human-readable name (defaults to slug)")
+	description := fs.String("description", "", "project description")
+	fs.Parse(args)
+
+	if *slug == "" {
+		fatal("--slug is required")
+	}
+	client := adminClient(*server, *adminKey)
+	resp, err := client.postJSON("/api/admin/projects", map[string]string{
+		"slug": *slug, "name": *name, "description": *description,
+	})
+	if err != nil {
+		fatal("create failed: %v", err)
+	}
+	var proj map[string]any
+	if err := readJSON(resp, &proj); err != nil {
+		fatal("create failed: %v", err)
+	}
+	fmt.Printf("project %v created\n", proj["slug"])
+	if n := str(proj["name"]); n != "" {
+		fmt.Printf("name: %s\n", n)
+	}
+	fmt.Printf("\ncreate a session in it with:\n  ah session create --server %s --task \"...\" --project %v\n",
+		strings.TrimRight(*server, "/"), proj["slug"])
+}
+
+// cmdProjectImport seeds a project's git repo from a local repository: it
+// bundles the repo's full history and uploads it to the admin import endpoint.
+// This is the easy "move this codebase into the project" path — re-running it
+// fast-forwards the project repo with new commits.
+func cmdProjectImport(args []string) {
+	fs := flag.NewFlagSet("project import", flag.ExitOnError)
+	server := fs.String("server", "", "server URL")
+	adminKey := fs.String("admin-key", "", "admin key")
+	slug := fs.String("slug", "", "project slug to import into")
+	repoPath := fs.String("repo", ".", "path to the local git repo to import (default: current dir)")
+	fs.Parse(args)
+
+	if *slug == "" {
+		fatal("--slug is required")
+	}
+
+	// Bundle the local repo's entire history (all branches + tags). --all
+	// requires at least one ref, so an empty repo fails fast here.
+	tmpFile, err := os.CreateTemp("", "ah-import-*.bundle")
+	if err != nil {
+		fatal("create temp file: %v", err)
+	}
+	tmpFile.Close()
+	defer os.Remove(tmpFile.Name())
+
+	if err := gitRun("-C", *repoPath, "bundle", "create", tmpFile.Name(), "--all"); err != nil {
+		fatal("create bundle from %s: %v", *repoPath, err)
+	}
+
+	client := adminClient(*server, *adminKey)
+	resp, err := client.postFile("/api/admin/projects/"+*slug+"/import", tmpFile.Name())
+	if err != nil {
+		fatal("import failed: %v", err)
+	}
+	var result map[string]any
+	if err := readJSON(resp, &result); err != nil {
+		fatal("import failed: %v", err)
+	}
+
+	fmt.Printf("imported into project %v\n", result["project"])
+	if heads, ok := result["heads"].([]any); ok && len(heads) > 0 {
+		fmt.Println("imported heads:")
+		for _, h := range heads {
+			fmt.Printf("  %v\n", h)
+		}
+		fmt.Printf("\nopen a session on the imported code with:\n  ah session create --server %s --project %v --task \"...\" --base %v\n",
+			strings.TrimRight(*server, "/"), result["project"], heads[0])
+	}
+}
+
+// cmdProjects lists all projects via the public discovery endpoint.
+func cmdProjects(args []string) {
+	fs := flag.NewFlagSet("projects", flag.ExitOnError)
+	server := fs.String("server", "", "server URL (defaults to saved config)")
+	fs.Parse(args)
+
+	var client *Client
+	if *server != "" {
+		client = &Client{BaseURL: strings.TrimRight(*server, "/"), HTTP: &http.Client{Timeout: 30 * time.Second}}
+	} else {
+		client = newClient(mustLoadConfig())
+	}
+	resp, err := client.get("/api/projects")
+	if err != nil {
+		fatal("request failed: %v", err)
+	}
+	var projects []map[string]any
+	if err := readJSON(resp, &projects); err != nil {
+		fatal("failed: %v", err)
+	}
+	if len(projects) == 0 {
+		fmt.Println("no projects")
+		return
+	}
+	for _, p := range projects {
+		desc := str(p["description"])
+		if desc != "" {
+			desc = " — " + desc
+		}
+		fmt.Printf("%-20v %s%s\n", p["slug"], str(p["name"]), desc)
+	}
+}
+
+// cmdProjectShow prints the project the current agent belongs to.
+func cmdProjectShow(args []string) {
+	cfg := mustLoadConfig()
+	client := newClient(cfg)
+	resp, err := client.get("/api/project")
+	if err != nil {
+		fatal("request failed: %v", err)
+	}
+	var proj map[string]any
+	if err := readJSON(resp, &proj); err != nil {
+		fatal("failed: %v", err)
+	}
+	fmt.Printf("project:     %v\n", proj["slug"])
+	fmt.Printf("name:        %v\n", proj["name"])
+	if d := str(proj["description"]); d != "" {
+		fmt.Printf("description: %s\n", d)
 	}
 }
 
@@ -834,6 +1001,10 @@ func main() {
 	switch cmd {
 	case "join":
 		cmdJoin(args)
+	case "project":
+		cmdProject(args)
+	case "projects":
+		cmdProjects(args)
 	case "session":
 		cmdSession(args)
 	case "push":
@@ -868,14 +1039,21 @@ func main() {
 func printUsage() {
 	fmt.Println(`ah — CLI for Agent Hub
 
+Project commands (operator):
+  projects [--server <url>]                   list projects (public discovery)
+  project create --slug <s> --server <url> [--name <n>] [--description <d>] [--admin-key <k>]
+  project import --slug <s> --server <url> [--repo <path>] [--admin-key <k>]   seed a project's git from a local repo
+  project show                                show this agent's project
+
 Session commands (operator):
-  session create --task "..." --server <url> [--admin-key <k>] [--base <hash>]
-  session list   --server <url> [--admin-key <k>]
+  session create --task "..." --server <url> [--project <slug>] [--admin-key <k>] [--base <hash>]
+  session list   --server <url> [--project <slug>] [--admin-key <k>]
   session close  <id> [--status done|failed] [--result <hash>] [--summary ...]
   session delete <id> [--yes]                 remove session + its agents/commits/posts
   session show                                show this agent's session
 
   (--admin-key is optional against a --no-auth server.)
+  (a session lives in exactly one project; agents inherit it.)
 
 Git commands:
   join --server <url> --name <id> --session <id> [--admin-key <k>]   register as agent
